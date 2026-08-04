@@ -37,7 +37,9 @@ class KiteLiveFeed:
         self.instrument_ids = instrument_ids or DEFAULT_INSTRUMENT_IDS
         self._broker = KiteFeed()
         self._pattern_detector = pattern_detector or PatternDetector()
-        self.candle_buffer = candle_buffer or CandleBuffer(pattern_detector=self._pattern_detector)
+        self.candle_buffer = candle_buffer or CandleBuffer(
+            pattern_detector=self._pattern_detector
+        )
         if candle_buffer is not None:
             self.candle_buffer.set_pattern_detector(self._pattern_detector)
 
@@ -54,9 +56,13 @@ class KiteLiveFeed:
 
     def _build_subscriptions(self) -> List[str]:
         index_definitions = MarketFeed.load_index_definitions_from_config()
-        instrument_map = {item["id"]: f"{item['exchange']}:{item['symbol']}" for item in index_definitions}
+        instrument_map = {
+            item["id"]: f"{item['exchange']}:{item['symbol']}"
+            for item in index_definitions
+        }
         self._symbol_to_instrument_id = {
-            f"{item['exchange']}:{item['symbol']}": item["id"] for item in index_definitions
+            f"{item['exchange']}:{item['symbol']}": item["id"]
+            for item in index_definitions
         }
         symbols: List[str] = []
         for instrument_id in self.instrument_ids:
@@ -69,22 +75,34 @@ class KiteLiveFeed:
 
     def _ensure_pattern_log_header(self) -> None:
         if not self.pattern_log_path.exists():
-            with self.pattern_log_path.open("w", encoding="utf-8", newline="") as csv_file:
+            with self.pattern_log_path.open(
+                "w", encoding="utf-8", newline=""
+            ) as csv_file:
                 writer = csv.DictWriter(
                     csv_file,
-                    fieldnames=["timestamp", "symbol", "pattern", "confidence", "price"],
+                    fieldnames=[
+                        "timestamp",
+                        "symbol",
+                        "pattern",
+                        "confidence",
+                        "price",
+                    ],
                 )
                 writer.writeheader()
 
     def start(self) -> None:
         logger.info("Entering KiteLiveFeed.start()")
         if KiteTicker is None:
-            raise RuntimeError("KiteTicker is unavailable. Install kiteconnect to run live feed.")
+            raise RuntimeError(
+                "KiteTicker is unavailable. Install kiteconnect to run live feed."
+            )
 
         self._broker.connect()
         self._broker.login()
         if not self._broker.logged_in:
-            logger.info("No cached Kite session found; generating session from request token")
+            logger.info(
+                "No cached Kite session found; generating session from request token"
+            )
             self._broker.generate_session()
         else:
             logger.info("Cached Kite session detected; skipping generate_session()")
@@ -98,7 +116,9 @@ class KiteLiveFeed:
         self._ticker.on_close = self._on_close
         self._ticker.on_error = self._on_error
         self._resolve_subscription_tokens()
-        logger.info("Starting Kite live feed for symbols: %s", self._subscription_symbols)
+        logger.info(
+            "Starting Kite live feed for symbols: %s", self._subscription_symbols
+        )
         logger.info("Starting Kite live feed for tokens: %s", self._subscription_tokens)
         logger.info("About to start Kite websocket connection")
         self._ticker.connect(threaded=True)
@@ -159,10 +179,14 @@ class KiteLiveFeed:
                 logger.warning("Could not resolve instrument token for %s", symbol)
                 continue
             self._subscription_tokens.append(token)
-            self._instrument_id_by_token[token] = self._symbol_to_instrument_id.get(symbol, symbol)
+            self._instrument_id_by_token[token] = self._symbol_to_instrument_id.get(
+                symbol, symbol
+            )
 
         if not self._subscription_tokens:
-            raise RuntimeError("No valid instrument tokens resolved for live feed subscriptions")
+            raise RuntimeError(
+                "No valid instrument tokens resolved for live feed subscriptions"
+            )
 
     def _on_error(self, ws, code, reason):
         logger.error("KiteTicker error (%s): %s", code, reason)
@@ -171,7 +195,7 @@ class KiteLiveFeed:
         logger.info("KiteTicker closed: %s %s", code, reason)
 
     def _on_ticks(self, ws, ticks: List[Dict[str, Any]]) -> None:
-        print(f"Received {len(ticks)} ticks")
+        # print(f"Received {len(ticks)} ticks")
         for tick in ticks:
             instrument_id = self._resolve_instrument_id(tick)
             if instrument_id is None:
@@ -202,7 +226,9 @@ class KiteLiveFeed:
         low_price = float(ohlc.get("low", ltp))
         close_price = float(ohlc.get("close", ltp))
         volume = float(tick.get("volume", 0.0))
-        timestamp = self._parse_timestamp(tick.get("timestamp") or tick.get("last_trade_time"))
+        timestamp = self._parse_timestamp(
+            tick.get("timestamp") or tick.get("last_trade_time")
+        )
 
         return MarketSnapshot(
             symbol=symbol,
@@ -238,11 +264,16 @@ class KiteLiveFeed:
         print("--------------------------------------------------")
         self._append_pattern_log(timestamp, symbol, pattern)
 
-    def _append_pattern_log(self, timestamp: str, symbol: str, pattern: Dict[str, object]) -> None:
+    def _append_pattern_log(
+        self, timestamp: str, symbol: str, pattern: Dict[str, object]
+    ) -> None:
         if not pattern:
             return
         with self.pattern_log_path.open("a", encoding="utf-8", newline="") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=["timestamp", "symbol", "pattern", "confidence", "price"])
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=["timestamp", "symbol", "pattern", "confidence", "price"],
+            )
             writer.writerow(
                 {
                     "timestamp": timestamp,

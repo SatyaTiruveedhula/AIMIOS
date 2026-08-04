@@ -18,8 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 logger = logging.getLogger(__name__)
 
+
 class KiteAuthError(Exception):
     pass
+
 
 class RequestTokenHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -29,7 +31,11 @@ class RequestTokenHandler(BaseHTTPRequestHandler):
         request_token = params.get("request_token", [None])[0]
         error = params.get("error", [None])[0]
 
-        if parsed.path != getattr(self.server, "callback_path", "/callback") and not request_token and not error:
+        if (
+            parsed.path != getattr(self.server, "callback_path", "/callback")
+            and not request_token
+            and not error
+        ):
             self.send_error(404, "Not Found")
             return
 
@@ -68,9 +74,12 @@ class RequestTokenHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         logger.debug("Callback server: %s", format % args)
 
+
 class KiteAuthStore:
     def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or Path(__file__).resolve().parent.parent / "database" / "aimios.db"
+        self.db_path = (
+            db_path or Path(__file__).resolve().parent.parent / "database" / "aimios.db"
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.db_path)
         self.connection.row_factory = sqlite3.Row
@@ -79,8 +88,7 @@ class KiteAuthStore:
         self._initialize_schema()
 
     def _initialize_schema(self) -> None:
-        self.connection.execute(
-            """
+        self.connection.execute("""
             CREATE TABLE IF NOT EXISTS kite_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 access_token TEXT NOT NULL,
@@ -88,8 +96,7 @@ class KiteAuthStore:
                 user_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
+            """)
         self.connection.commit()
 
     def save_access_token(
@@ -117,6 +124,13 @@ class KiteAuthStore:
         )
         row = cursor.fetchone()
         return dict(row) if row else None
+
+    def delete_access_tokens(self) -> None:
+        cursor = self.connection.cursor()
+        cursor.execute("DELETE FROM kite_sessions")
+        self.connection.commit()
+        logger.info("Deleted cached Kite sessions")
+
 
 class KiteFeed(BrokerBase):
     def __init__(self) -> None:
@@ -154,11 +168,15 @@ class KiteFeed(BrokerBase):
         if not self.redirect_url:
             missing.append("REDIRECT_URL")
         if missing:
-            raise KiteAuthError(f"Missing required environment variables: {', '.join(missing)}")
+            raise KiteAuthError(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
 
         parsed = urlparse(self.redirect_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise KiteAuthError(f"REDIRECT_URL must be a valid HTTP/HTTPS URL: {self.redirect_url}")
+            raise KiteAuthError(
+                f"REDIRECT_URL must be a valid HTTP/HTTPS URL: {self.redirect_url}"
+            )
 
         self.callback_host = parsed.hostname
         self.callback_port = parsed.port or int(self.callback_port or 8000)
@@ -182,14 +200,46 @@ class KiteFeed(BrokerBase):
 
     def _load_cached_session(self) -> bool:
         cached = self.storage.get_latest_access_token()
+
         if not cached:
+            logger.info("No cached Kite access token found")
             return False
+
         self.access_token = cached["access_token"]
-        if self.client is not None:
+
+        if self.client is None:
+            logger.error("Kite client is not initialized")
+            return False
+
+        try:
+            # Apply cached token
             self.client.set_access_token(self.access_token)
-        self.logged_in = True
-        logger.info("Loaded cached Kite access token from storage")
-        return True
+
+            # Validate token with Kite
+            profile = self.client.profile()
+
+            logger.info(
+                "Cached Kite access token is valid for user: %s",
+                profile.get("user_name", profile.get("user_id", "Unknown")),
+            )
+
+            self.logged_in = True
+            return True
+
+        except Exception as exc:
+            logger.warning("Cached Kite access token has expired or is invalid")
+            logger.warning("Reason: %s", exc)
+
+            self.access_token = None
+            self.logged_in = False
+
+            try:
+                self.storage.delete_access_tokens()
+                logger.info("Expired cached token removed from storage")
+            except Exception:
+                logger.warning("Could not remove expired token from storage")
+
+            return False
 
     def login(self, timeout: int = 180) -> str | None:
         logger.info("Entering KiteFeed.login()")
@@ -238,7 +288,10 @@ class KiteFeed(BrokerBase):
             raise KiteAuthError(f"Kite login failed: {error}")
 
         self.request_token = request_token
-        logger.info("Request token extracted from callback: %s", "present" if bool(self.request_token) else "missing")
+        logger.info(
+            "Request token extracted from callback: %s",
+            "present" if bool(self.request_token) else "missing",
+        )
         if not self.request_token:
             raise KiteAuthError("Request token was not received")
 
@@ -253,7 +306,9 @@ class KiteFeed(BrokerBase):
 
         try:
             logger.info("Generating Kite session from request token")
-            session_data = self.client.generate_session(self.request_token, api_secret=self.api_secret)
+            session_data = self.client.generate_session(
+                self.request_token, api_secret=self.api_secret
+            )
         except Exception as exc:
             logger.exception("Failed to generate Kite session")
             logger.error("Failed to generate Kite session: %s", exc)
@@ -266,7 +321,9 @@ class KiteFeed(BrokerBase):
         created_at = datetime.now(timezone.utc)
 
         if not self.access_token:
-            raise KiteAuthError("Kite session generation did not return an access token")
+            raise KiteAuthError(
+                "Kite session generation did not return an access token"
+            )
 
         self.client.set_access_token(self.access_token)
         logger.info("Set Kite access token on KiteConnect client")
@@ -295,7 +352,9 @@ class KiteFeed(BrokerBase):
         if self.client is None:
             raise KiteAuthError("Kite client is not initialized. Call connect() first.")
         if not self.access_token or not self.logged_in:
-            raise KiteAuthError("Kite client is not authenticated. Call generate_session() first.")
+            raise KiteAuthError(
+                "Kite client is not authenticated. Call generate_session() first."
+            )
 
         logger.info("Fetching quote for %s", instrument)
         try:
@@ -309,7 +368,9 @@ class KiteFeed(BrokerBase):
         if self.client is None:
             raise KiteAuthError("Kite client is not initialized. Call connect() first.")
         if not self.access_token or not self.logged_in:
-            raise KiteAuthError("Kite client is not authenticated. Call generate_session() first.")
+            raise KiteAuthError(
+                "Kite client is not authenticated. Call generate_session() first."
+            )
 
         logger.info("Fetching quotes for %s", instruments)
         try:
@@ -319,15 +380,21 @@ class KiteFeed(BrokerBase):
             logger.error("Failed to fetch quotes for %s: %s", instruments, exc)
             raise
 
-    def get_historical(self, instrument: str, start_date: datetime, end_date: datetime, interval: str):
+    def get_historical(
+        self, instrument: str, start_date: datetime, end_date: datetime, interval: str
+    ):
         if self.client is None:
             raise KiteAuthError("Kite client is not initialized. Call connect() first.")
         if not self.access_token or not self.logged_in:
-            raise KiteAuthError("Kite client is not authenticated. Call generate_session() first.")
+            raise KiteAuthError(
+                "Kite client is not authenticated. Call generate_session() first."
+            )
 
         logger.info("Fetching historical data for %s", instrument)
         try:
-            return self.client.historical_data(instrument, start_date, end_date, interval)
+            return self.client.historical_data(
+                instrument, start_date, end_date, interval
+            )
         except Exception as exc:
             logger.exception("Failed to fetch historical data for %s", instrument)
             logger.error("Failed to fetch historical data for %s: %s", instrument, exc)
@@ -347,7 +414,9 @@ class KiteFeed(BrokerBase):
         self.callback_server.error = None
         self.callback_server.request_token_event = threading.Event()
         self.callback_server.callback_path = self.callback_path
-        self.server_thread = threading.Thread(target=self.callback_server.serve_forever, daemon=True)
+        self.server_thread = threading.Thread(
+            target=self.callback_server.serve_forever, daemon=True
+        )
         self.server_thread.start()
         logger.info(
             "Started callback server on http://%s:%s/callback",
