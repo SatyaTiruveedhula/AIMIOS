@@ -1,0 +1,8 @@
+requests
+websockets
+python-dotenv
+kiteconnect
+pytest
+
+[ui]
+tkinter

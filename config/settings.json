@@ -1,0 +1,6 @@
+{
+  "env": "development",
+  "log_level": "INFO",
+  "default_broker": "mock",
+  "default_market_snapshot_interval": 1
+}

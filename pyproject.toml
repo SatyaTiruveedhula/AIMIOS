@@ -1,0 +1,39 @@
+[project]
+name = "aimios"
+version = "0.1.0"
+description = "A lightweight desktop AI assistant for Indian stock market traders."
+authors = [
+    { name = "AIMIOS Team", email = "team@example.com" }
+]
+requires-python = ">=3.14,<4.0"
+readme = "README.md"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "requests",
+    "websockets",
+    "python-dotenv",
+    "kiteconnect",
+    "pytest",
+]
+
+[project.scripts]
+aimios = "aimios.__main__:main"
+
+[project.optional-dependencies]
+ui = ["tkinter"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["aimios*", "app*"]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,2 @@
+[console_scripts]
+aimios = aimios.__main__:main

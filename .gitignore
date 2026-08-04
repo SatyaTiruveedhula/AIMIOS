@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+.venv\
+*.pyc
+*.pyo
+*.pyd
+*.db
+aimios.db
+database/*.db
+logs/
+.env
+.venv/
+.vscode/

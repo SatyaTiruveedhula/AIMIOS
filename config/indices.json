@@ -1,0 +1,19 @@
+{
+  "indices": [
+    {
+      "id": "NIFTY",
+      "exchange": "NSE",
+      "symbol": "NIFTY 50"
+    },
+    {
+      "id": "BANKNIFTY",
+      "exchange": "NSE",
+      "symbol": "NIFTY BANK"
+    },
+    {
+      "id": "SENSEX",
+      "exchange": "BSE",
+      "symbol": "SENSEX"
+    }
+  ]
+}

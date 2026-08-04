@@ -1,0 +1,6 @@
+{
+  "app_name": "AIMIOS",
+  "version": "0.1.0",
+  "database_path": "database/aimios.db",
+  "log_path": "logs/aimios.log"
+}
