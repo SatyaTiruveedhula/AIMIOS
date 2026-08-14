@@ -1,264 +1,823 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from .engine import BaseEngine
-from .swing_detection import SwingDetectionEngine
-from aimios.market.candle_buffer import Candle
-
-logger = logging.getLogger(__name__)
+# ============================================================
+# SIGNAL
+# ============================================================
 
 
-@dataclass(frozen=True)
+@dataclass
 class PatternSignal:
+    """
+    Standard pattern signal returned by PatternRecognitionEngine.
+    """
+
     pattern: str
     direction: str
     confidence: float
-    entry: float
-    stoploss: float
-    target: float
-    timestamp: Any
-    symbol: str
+    entry: Optional[float] = None
+    stoploss: Optional[float] = None
+    target: Optional[float] = None
+    timestamp: Any = None
+    symbol: Optional[str] = None
 
 
-@dataclass(frozen=True)
-class PatternCandidate:
-    pattern: str
-    score: float
-    confidence: float
-    reason: str
+# ============================================================
+# PATTERN RECOGNITION ENGINE
+# ============================================================
 
 
-class PatternRecognitionEngine(BaseEngine):
-    name = "PatternRecognition"
+class PatternRecognitionEngine:
+    """
+    AIMIOS pattern-recognition compatibility engine.
 
-    def __init__(self, app: Any = None, swing_engine: Optional[SwingDetectionEngine] = None, **_: Any) -> None:
-        super().__init__(app)
-        self.swing_engine = swing_engine or SwingDetectionEngine(app)
+    This class is the public engine expected by:
 
-    def start(self) -> None:
-        super().start()
-        logger.info("Pattern recognition engine started")
+        tests/test_pattern.py
 
-    def stop(self) -> None:
-        super().stop()
-        logger.info("Pattern recognition engine stopped")
+    and by CandleBuffer.
 
-    def detect_from_candles(self, candles: List[Candle], symbol: str = "") -> List[PatternSignal]:
-        if len(candles) < 3:
+    It uses completed Candle objects and returns PatternSignal
+    objects through detect_from_candles().
+    """
+
+    name = "PatternRecognitionEngine"
+
+    def __init__(
+        self,
+        app: Any = None,
+        swing_engine: Any = None,
+    ) -> None:
+
+        self.app = app
+        self.swing_engine = swing_engine
+
+        self.detector = PatternDetector()
+
+    # ========================================================
+    # PUBLIC API
+    # ========================================================
+
+    def detect_from_candles(
+        self,
+        candles: List[Any],
+        symbol: str = "",
+    ) -> List[PatternSignal]:
+        """
+        Detect patterns from completed candles.
+
+        Returns:
+            List[PatternSignal]
+
+        Returns an empty list when no pattern is detected.
+        """
+
+        if not candles:
             return []
 
-        last = candles[-1]
-        candidates = self._collect_candidates(candles)
-        if not candidates:
+        result = self.detector.detect(candles)
+
+        if not result:
             return []
 
-        ranked = sorted(candidates, key=lambda item: (item.score, item.confidence), reverse=True)
-        selected = self._select_best_candidate(ranked)
-        confidence = self._apply_confidence_modifiers(selected, ranked)
-
-        return [
-            PatternSignal(
-                pattern="W_PATTERN" if selected.pattern == "W" else selected.pattern,
-                direction=self._direction_for_pattern(selected.pattern),
-                confidence=confidence,
-                entry=last.close,
-                stoploss=min(last.low, last.close),
-                target=last.close + max(last.high - last.low, 1.0),
-                timestamp=last.timestamp,
-                symbol=symbol,
+        pattern = str(
+            result.get(
+                "pattern",
+                "",
             )
-        ]
+        ).upper()
 
-    def _collect_candidates(self, candles: List[Candle]) -> List[PatternCandidate]:
-        detectors = [
-            self._detect_w_pattern,
-            self._detect_double_bottom,
-            self._detect_double_top,
-            self._detect_m_pattern,
-            self._detect_v_reversal,
-            self._detect_choch,
-            self._detect_breakout,
-        ]
-        candidates: List[PatternCandidate] = []
-        for detector in detectors:
-            candidate = detector(candles)
-            if candidate is not None:
-                candidates.append(candidate)
-        return candidates
+        if not pattern:
+            return []
 
-    def _select_best_candidate(self, ranked: List[PatternCandidate]) -> PatternCandidate:
-        selected = ranked[0]
-        if selected.pattern == "CHOCH":
-            reversal = next((item for item in ranked if item.pattern in {"W", "DOUBLE_BOTTOM", "DOUBLE_TOP", "M", "V_REVERSAL"}), None)
-            if reversal is not None:
-                return reversal
-        if selected.pattern == "BREAKOUT":
-            reversal = next((item for item in ranked if item.pattern in {"W", "DOUBLE_BOTTOM", "DOUBLE_TOP", "M", "V_REVERSAL"}), None)
-            if reversal is not None:
-                return reversal
-        return selected
+        confidence = float(
+            result.get(
+                "confidence",
+                0.0,
+            )
+        )
 
-    def _apply_confidence_modifiers(self, selected: PatternCandidate, candidates: List[PatternCandidate]) -> float:
-        confidence = min(100.0, max(0.0, selected.confidence))
-        has_reversal = any(item.pattern in {"W", "DOUBLE_BOTTOM", "DOUBLE_TOP", "M", "V_REVERSAL"} for item in candidates)
-        has_choch = any(item.pattern == "CHOCH" for item in candidates)
-        has_breakout = any(item.pattern == "BREAKOUT" for item in candidates)
+        entry = result.get(
+            "entry",
+            None,
+        )
 
-        if selected.pattern in {"W", "DOUBLE_BOTTOM", "DOUBLE_TOP", "M", "V_REVERSAL"} and has_reversal:
-            if has_choch:
-                confidence = min(100.0, confidence + 5.0)
-            if has_breakout:
-                confidence = min(100.0, confidence + 3.0)
-        elif selected.pattern == "CHOCH":
-            if has_breakout:
-                confidence = min(100.0, confidence + 3.0)
+        if entry is None:
+            entry = float(
+                getattr(
+                    candles[-1],
+                    "close",
+                    getattr(
+                        candles[-1],
+                        "ltp",
+                        0.0,
+                    ),
+                )
+            )
 
-        return round(confidence, 2)
+        direction = self._direction_for_pattern(
+            pattern,
+        )
 
-    def _direction_for_pattern(self, pattern: str) -> str:
-        if pattern in {"DOUBLE_BOTTOM", "W", "V_REVERSAL"}:
-            return "BUY"
-        if pattern in {"DOUBLE_TOP", "M"}:
+        if direction is None:
+            return []
+
+        timestamp = getattr(
+            candles[-1],
+            "timestamp",
+            None,
+        )
+
+        stoploss = result.get(
+            "stoploss",
+            None,
+        )
+
+        target = result.get(
+            "target",
+            None,
+        )
+
+        signal = PatternSignal(
+            pattern=pattern,
+            direction=direction,
+            confidence=confidence,
+            entry=entry,
+            stoploss=stoploss,
+            target=target,
+            timestamp=timestamp,
+            symbol=symbol,
+        )
+
+        return [signal]
+
+    # ========================================================
+    # DIRECTION
+    # ========================================================
+
+    @staticmethod
+    def _direction_for_pattern(
+        pattern: str,
+    ) -> Optional[str]:
+        """
+        Map pattern to trading direction.
+
+        M / DOUBLE_TOP:
+            SELL
+
+        W / DOUBLE_BOTTOM:
+            BUY
+
+        Other patterns:
+            No M/W directional signal.
+        """
+
+        if pattern in {
+            "M",
+            "DOUBLE_TOP",
+        }:
             return "SELL"
-        return "SELL"
 
-    def _detect_w_pattern(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 5:
-            return None
+        if pattern in {
+            "W",
+            "DOUBLE_BOTTOM",
+        }:
+            return "BUY"
 
-        prices = [c.close for c in candles[-5:]]
-        minima: List[float] = []
-        for index in range(1, len(prices) - 1):
-            if prices[index] <= prices[index - 1] and prices[index] <= prices[index + 1]:
-                minima.append(prices[index])
-
-        if len(minima) >= 2:
-            trough_a = minima[-2]
-            trough_b = minima[-1]
-            if prices[-1] >= max(trough_a, trough_b) and abs(trough_a - trough_b) / max(max(trough_a, trough_b), 1.0) > 0.03:
-                return PatternCandidate(
-                    pattern="W",
-                    score=100.0,
-                    confidence=88.0,
-                    reason="Two distinct troughs with a recovery into the final close",
-                )
         return None
 
-    def _detect_double_bottom(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 5:
-            return None
+    # ========================================================
+    # RESET / CLEAR
+    # ========================================================
 
-        prices = [c.close for c in candles[-5:]]
-        minima: List[float] = []
-        for index in range(1, len(prices) - 1):
-            if prices[index] <= prices[index - 1] and prices[index] <= prices[index + 1]:
-                minima.append(prices[index])
+    def reset(self) -> None:
+        self.detector.reset()
 
-        if len(minima) >= 2:
-            trough_a = minima[-2]
-            trough_b = minima[-1]
-            if abs(trough_a - trough_b) / max(max(trough_a, trough_b), 1.0) <= 0.03 and prices[-1] >= max(trough_a, trough_b):
-                return PatternCandidate(
-                    pattern="DOUBLE_BOTTOM",
-                    score=95.0,
-                    confidence=86.0,
-                    reason="Near-equal troughs with a successful breakout above the neckline",
-                )
-        if len(prices) >= 4 and prices[-1] > min(prices[:-1]) and prices[-1] < max(prices[:-1]):
-            return PatternCandidate(
-                pattern="DOUBLE_BOTTOM",
-                score=90.0,
-                confidence=82.0,
-                reason="Bullish recovery from a swing low",
+    def clear(self) -> None:
+        self.detector.clear()
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def status(self) -> dict:
+        return {
+            "engine": self.name,
+            "detector": self.detector.status(),
+        }
+
+
+# ============================================================
+# PATTERN DETECTOR
+# ============================================================
+
+
+class PatternDetector:
+    """
+    Minimal deterministic AIMIOS live pattern detector.
+
+    Supported patterns:
+
+        DOUBLE_TOP
+        DOUBLE_BOTTOM
+        V_REVERSAL
+        W
+        M
+        BREAKOUT
+        FAKE_BREAKOUT
+        EXHAUSTION
+
+    The detector works from completed candle close prices.
+    """
+
+    name = "PatternDetector"
+
+    def __init__(self) -> None:
+        self.last_pattern: str | None = None
+        self.last_confidence: float = 0.0
+
+    # ========================================================
+    # PUBLIC API
+    # ========================================================
+
+    def detect(
+        self,
+        candles: List[Any],
+    ) -> dict:
+        """
+        Detect the first valid pattern.
+
+        Returns:
+
+            {
+                "pattern": str,
+                "confidence": float,
+            }
+
+        or:
+
+            {}
+        """
+
+        if not candles:
+            return {}
+
+        prices = self._prices(
+            candles,
+        )
+
+        if not prices:
+            return {}
+
+        # ----------------------------------------------------
+        # Structural patterns first.
+        # ----------------------------------------------------
+
+        result = self._detect_w(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
             )
-        return None
 
-    def _detect_double_top(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 5:
-            return None
+        result = self._detect_double_top(
+            prices,
+        )
 
-        prices = [c.close for c in candles[-5:]]
-        maxima: List[float] = []
-        for index in range(1, len(prices) - 1):
-            if prices[index] >= prices[index - 1] and prices[index] >= prices[index + 1]:
-                maxima.append(prices[index])
+        if result:
+            return self._store(
+                result,
+            )
 
-        if len(maxima) >= 2:
-            peak_a = maxima[-2]
-            peak_b = maxima[-1]
-            if abs(peak_a - peak_b) / max(max(peak_a, peak_b), 1.0) <= 0.03 and prices[-1] <= min(peak_a, peak_b):
-                return PatternCandidate(
-                    pattern="DOUBLE_TOP",
-                    score=90.0,
-                    confidence=84.0,
-                    reason="Near-equal swing highs followed by a move below the neckline",
+        result = self._detect_double_bottom(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
+            )
+
+        result = self._detect_m(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
+            )
+
+        result = self._detect_v_reversal(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
+            )
+
+        result = self._detect_fake_breakout(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
+            )
+
+        result = self._detect_exhaustion(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
+            )
+
+        result = self._detect_breakout(
+            prices,
+        )
+
+        if result:
+            return self._store(
+                result,
+            )
+
+        return {}
+
+    # ========================================================
+    # PRICE EXTRACTION
+    # ========================================================
+
+    def _prices(
+        self,
+        candles: List[Any],
+    ) -> List[float]:
+        """
+        Extract close prices from Candle objects.
+
+        Falls back to ltp when close is unavailable.
+        """
+
+        prices: List[float] = []
+
+        for candle in candles:
+
+            value = getattr(
+                candle,
+                "close",
+                None,
+            )
+
+            if value is None:
+                value = getattr(
+                    candle,
+                    "ltp",
+                    None,
                 )
-        return None
 
-    def _detect_m_pattern(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 5:
-            return None
+            if value is None:
+                continue
 
-        prices = [c.close for c in candles[-5:]]
-        maxima: List[float] = []
-        for index in range(1, len(prices) - 1):
-            if prices[index] >= prices[index - 1] and prices[index] >= prices[index + 1]:
-                maxima.append(prices[index])
-
-        if len(maxima) >= 2:
-            peak_a = maxima[-2]
-            peak_b = maxima[-1]
-            if abs(peak_a - peak_b) / max(max(peak_a, peak_b), 1.0) <= 0.03 and prices[-1] <= min(peak_a, peak_b):
-                return PatternCandidate(
-                    pattern="M",
-                    score=88.0,
-                    confidence=80.0,
-                    reason="M-shaped structure with a close below the second swing high",
+            try:
+                prices.append(
+                    float(value),
                 )
-        return None
 
-    def _detect_v_reversal(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 4:
+            except TypeError, ValueError:
+                continue
+
+        return prices
+
+    # ========================================================
+    # HELPERS
+    # ========================================================
+
+    @staticmethod
+    def _same_level(
+        a: float,
+        b: float,
+        tolerance_pct: float = 3.0,
+    ) -> bool:
+
+        base = max(
+            abs(a),
+            abs(b),
+            0.000001,
+        )
+
+        difference_pct = abs(a - b) / base * 100.0
+
+        return difference_pct <= tolerance_pct
+
+    @staticmethod
+    def _confidence(
+        value: float = 80.0,
+    ) -> float:
+
+        return max(
+            1.0,
+            min(
+                100.0,
+                float(value),
+            ),
+        )
+
+    def _store(
+        self,
+        result: dict,
+    ) -> dict:
+
+        self.last_pattern = result.get(
+            "pattern",
+        )
+
+        self.last_confidence = float(
+            result.get(
+                "confidence",
+                0.0,
+            )
+        )
+
+        return result
+
+    # ========================================================
+    # DOUBLE TOP
+    # ========================================================
+
+    def _detect_double_top(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 5:
             return None
 
-        prices = [c.close for c in candles[-4:]]
-        if prices[0] > prices[1] and prices[-1] >= prices[0] * 0.95 and prices[-1] >= prices[-2]:
-            return PatternCandidate(
-                pattern="V_REVERSAL",
-                score=82.0,
-                confidence=75.0,
-                reason="Sharp reversal after a bearish pivot",
-            )
-        return None
+        p = prices[-5:]
 
-    def _detect_choch(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 2:
+        first = p[0]
+        valley = p[1]
+        high1 = p[2]
+        valley2 = p[3]
+        high2 = p[4]
+
+        if not (
+            high1 > first and high1 > valley and high1 > valley2 and high1 >= high2
+        ):
             return None
 
-        last = candles[-1]
-        prev = candles[-2]
-        if last.close < prev.low and last.close < prev.close:
-            return PatternCandidate(
-                pattern="CHOCH",
-                score=70.0,
-                confidence=70.0,
-                reason="Close below the previous swing low",
-            )
-        return None
-
-    def _detect_breakout(self, candles: List[Candle]) -> Optional[PatternCandidate]:
-        if len(candles) < 4:
+        if not self._same_level(
+            high1,
+            high2,
+            tolerance_pct=6.0,
+        ):
             return None
 
-        prices = [c.close for c in candles[-4:]]
-        if prices[-1] >= prices[-2] and prices[-2] >= prices[-3] and prices[-1] > max(prices[:-1]):
-            return PatternCandidate(
-                pattern="BREAKOUT",
-                score=60.0,
-                confidence=65.0,
-                reason="Momentum break above the preceding trend",
-            )
+        if valley2 >= min(
+            high1,
+            high2,
+        ):
+            return None
+
+        return {
+            "pattern": "DOUBLE_TOP",
+            "confidence": self._confidence(
+                85.0,
+            ),
+            "entry": high2,
+        }
+
+    # ========================================================
+    # DOUBLE BOTTOM
+    # ========================================================
+
+    def _detect_double_bottom(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 5:
+            return None
+
+        p = prices[-5:]
+
+        first = p[0]
+        high1 = p[1]
+        low1 = p[2]
+        high2 = p[3]
+        low2 = p[4]
+
+        if not (low1 < first and low1 < high1 and low1 < high2 and low1 <= low2):
+            return None
+
+        if not self._same_level(
+            low1,
+            low2,
+            tolerance_pct=6.0,
+        ):
+            return None
+
+        if high2 <= max(
+            low1,
+            low2,
+        ):
+            return None
+
+        return {
+            "pattern": "DOUBLE_BOTTOM",
+            "confidence": self._confidence(
+                85.0,
+            ),
+            "entry": low2,
+        }
+
+    # ========================================================
+    # W PATTERN
+    # ========================================================
+
+    def _detect_w(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 5:
+            return None
+
+        p = prices[-5:]
+
+        a = p[0]
+        b = p[1]
+        c = p[2]
+        d = p[3]
+        e = p[4]
+
+        if not (c < b and c < d and e < d):
+            return None
+
+        if not self._same_level(
+            c,
+            e,
+            tolerance_pct=6.0,
+        ):
+            return None
+
+        if d <= max(
+            c,
+            e,
+        ):
+            return None
+
+        if b <= a:
+            return None
+
+        return {
+            "pattern": "W",
+            "confidence": self._confidence(
+                84.0,
+            ),
+            "entry": e,
+        }
+
+    def _detect_w_pattern(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        return self._detect_w(
+            prices,
+        )
+
+    # ========================================================
+    # M PATTERN
+    # ========================================================
+
+    def _detect_m(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 5:
+            return None
+
+        p = prices[-5:]
+
+        a = p[0]
+        b = p[1]
+        c = p[2]
+        d = p[3]
+        e = p[4]
+
+        if not (c > b and c > d and e <= d):
+            return None
+
+        # Second peak must be reasonably close.
+        if not self._same_level(
+            c,
+            e,
+            tolerance_pct=6.0,
+        ):
+            return None
+
+        if d >= min(
+            c,
+            e,
+        ):
+            return None
+
+        return {
+            "pattern": "M",
+            "confidence": self._confidence(
+                84.0,
+            ),
+            "entry": e,
+        }
+
+    def _detect_m_pattern(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        return self._detect_m(
+            prices,
+        )
+
+    # ========================================================
+    # V REVERSAL
+    # ========================================================
+
+    def _detect_v_reversal(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 3:
+            return None
+
+        p = prices[-3:]
+
+        first = p[0]
+        middle = p[1]
+        last = p[2]
+
+        if middle < first and last > middle and last > first:
+            return {
+                "pattern": "V_REVERSAL",
+                "confidence": self._confidence(
+                    80.0,
+                ),
+                "entry": last,
+            }
+
+        if middle > first and last < middle and last < first:
+            return {
+                "pattern": "V_REVERSAL",
+                "confidence": self._confidence(
+                    80.0,
+                ),
+                "entry": last,
+            }
+
         return None
+
+    # ========================================================
+    # BREAKOUT
+    # ========================================================
+
+    def _detect_breakout(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 3:
+            return None
+
+        previous = prices[-3:-1]
+        last = prices[-1]
+
+        resistance = max(
+            previous,
+        )
+
+        support = min(
+            previous,
+        )
+
+        if last > resistance:
+            return {
+                "pattern": "BREAKOUT",
+                "confidence": self._confidence(
+                    82.0,
+                ),
+                "entry": last,
+            }
+
+        if last < support:
+            return {
+                "pattern": "BREAKOUT",
+                "confidence": self._confidence(
+                    82.0,
+                ),
+                "entry": last,
+            }
+
+        return None
+
+    # ========================================================
+    # FAKE BREAKOUT
+    # ========================================================
+
+    def _detect_fake_breakout(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 3:
+            return None
+
+        first = prices[-3]
+        breakout = prices[-2]
+        last = prices[-1]
+
+        if breakout > first and last < breakout and last > first:
+            return {
+                "pattern": "FAKE_BREAKOUT",
+                "confidence": self._confidence(
+                    78.0,
+                ),
+                "entry": last,
+            }
+
+        if breakout < first and last > breakout and last < first:
+            return {
+                "pattern": "FAKE_BREAKOUT",
+                "confidence": self._confidence(
+                    78.0,
+                ),
+                "entry": last,
+            }
+
+        return None
+
+    # ========================================================
+    # EXHAUSTION
+    # ========================================================
+
+    def _detect_exhaustion(
+        self,
+        prices: List[float],
+    ) -> dict | None:
+
+        if len(prices) < 3:
+            return None
+
+        first = prices[-3]
+        second = prices[-2]
+        last = prices[-1]
+
+        move1 = abs(
+            second - first,
+        )
+
+        move2 = abs(
+            last - second,
+        )
+
+        if move1 <= 0:
+            return None
+
+        if move2 <= move1 * 0.20:
+            return {
+                "pattern": "EXHAUSTION",
+                "confidence": self._confidence(
+                    75.0,
+                ),
+                "entry": last,
+            }
+
+        return None
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset(self) -> None:
+        self.last_pattern = None
+        self.last_confidence = 0.0
+
+    def clear(self) -> None:
+        self.reset()
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def status(self) -> dict:
+        return {
+            "engine": self.name,
+            "last_pattern": self.last_pattern,
+            "last_confidence": self.last_confidence,
+        }
