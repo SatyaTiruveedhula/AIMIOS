@@ -18,14 +18,49 @@ class PatternSentinel(BaseEngine):
 
         completed Candle
               ↓
+        CandleBuffer
+              ↓
         PatternSentinel
               ↓
         MWPatternEngine
               ↓
         BUY / SELL alert
 
-    IMPORTANT:
-    Only completed candles should be supplied here.
+    IMPORTANT
+    ---------
+    Only completed candles must be supplied to process_candle().
+
+    M RULES
+    -------
+        HIGH1
+           |
+           | >= 0.13%
+           |
+        VALLEY
+           |
+           | recovery
+           |
+        HIGH2
+
+        HIGH1 -> VALLEY >= 0.13%
+        HIGH1 vs HIGH2 <= 0.03%
+        HIGH1 -> HIGH2 >= 7 candles
+
+    W RULES
+    -------
+        VALLEY1
+           |
+           | >= 0.13%
+           |
+          HIGH
+           |
+           | pullback
+           |
+        VALLEY2
+
+        VALLEY1 -> HIGH >= 0.13%
+        VALLEY1 vs VALLEY2 <= 0.03%
+        VALLEY1 -> VALLEY2 >= 7 candles
     """
 
     name = "PatternSentinel"
@@ -39,12 +74,25 @@ class PatternSentinel(BaseEngine):
 
         super().__init__(app)
 
+        # ------------------------------------------------------
+        # M/W ENGINE
+        # ------------------------------------------------------
+
         self.engine = MWPatternEngine()
+
+        # ------------------------------------------------------
+        # ALERT CALLBACK
+        # ------------------------------------------------------
 
         self.alert_callback = alert_callback
 
-        # Prevent duplicate alerts for the same completed
-        # pattern structure.
+        # ------------------------------------------------------
+        # DUPLICATE PROTECTION
+        #
+        # Keep the complete structural identity of the last
+        # alert instead of only the latest candle.
+        # ------------------------------------------------------
+
         self._last_alert_key: Optional[str] = None
 
         self._started = False
@@ -92,15 +140,62 @@ class PatternSentinel(BaseEngine):
         """
         Process one newly completed candle.
 
-        `candles` must contain completed candles only.
+        candles:
+            Completed candles only.
+
+        candle:
+            The newly completed candle.
+
+        Returns:
+            Alert payload if a NEW M/W pattern is detected.
+            None otherwise.
         """
 
         if not self._started:
             return None
 
-        # M/W detector requires enough candles.
-        if len(candles) < 7:
+        # ------------------------------------------------------
+        # Need enough completed candles.
+        #
+        # Minimum outer-pivot distance is 7 candles.
+        # ------------------------------------------------------
+
+        if len(candles) < 8:
             return None
+
+        # ------------------------------------------------------
+        # Make sure the supplied candle is actually the latest
+        # completed candle.
+        # ------------------------------------------------------
+
+        if not candles:
+            return None
+
+        latest_candle = candles[-1]
+
+        if getattr(
+            latest_candle,
+            "candle_id",
+            None,
+        ) != getattr(
+            candle,
+            "candle_id",
+            None,
+        ):
+            logger.warning(
+                "PatternSentinel received candle that is "
+                "not the latest completed candle | "
+                "symbol=%s | candle_id=%s | latest_id=%s",
+                symbol,
+                getattr(candle, "candle_id", None),
+                getattr(latest_candle, "candle_id", None),
+            )
+
+            return None
+
+        # ======================================================
+        # RUN M/W ENGINE
+        # ======================================================
 
         try:
 
@@ -120,6 +215,10 @@ class PatternSentinel(BaseEngine):
 
         if signal is None:
             return None
+
+        # ======================================================
+        # BUILD ALERT
+        # ======================================================
 
         payload = self._build_alert(
             signal=signal,
@@ -141,11 +240,16 @@ class PatternSentinel(BaseEngine):
         if alert_key == self._last_alert_key:
 
             logger.debug(
-                "Duplicate M/W signal ignored: %s",
+                "Duplicate M/W signal ignored | " "symbol=%s | key=%s",
+                symbol,
                 alert_key,
             )
 
             return None
+
+        # ------------------------------------------------------
+        # Save new alert key.
+        # ------------------------------------------------------
 
         self._last_alert_key = alert_key
 
@@ -154,8 +258,19 @@ class PatternSentinel(BaseEngine):
         # ======================================================
 
         logger.warning(
-            "MW ALERT | %s | pattern=%s | direction=%s | "
-            "confidence=%.1f | entry=%s | stoploss=%s | target=%s",
+            "MW ALERT | %s | "
+            "pattern=%s | "
+            "direction=%s | "
+            "confidence=%.1f | "
+            "entry=%s | "
+            "stoploss=%s | "
+            "target=%s | "
+            "high1=%s | "
+            "valley=%s | "
+            "high2=%s | "
+            "valley1=%s | "
+            "high=%s | "
+            "valley2=%s",
             symbol,
             payload["pattern"],
             payload["direction"],
@@ -163,6 +278,12 @@ class PatternSentinel(BaseEngine):
             payload.get("entry"),
             payload.get("stoploss"),
             payload.get("target"),
+            payload.get("high1"),
+            payload.get("valley"),
+            payload.get("high2"),
+            payload.get("valley1"),
+            payload.get("high"),
+            payload.get("valley2"),
         )
 
         # ======================================================
@@ -193,6 +314,9 @@ class PatternSentinel(BaseEngine):
         candle: Candle,
         symbol: str,
     ) -> Optional[dict]:
+        """
+        Convert MWPatternSignal into AIMIOS alert payload.
+        """
 
         pattern = str(
             getattr(
@@ -203,7 +327,7 @@ class PatternSentinel(BaseEngine):
         ).upper()
 
         # ------------------------------------------------------
-        # Only M/W family belongs to this sentinel.
+        # Only M/W patterns are accepted.
         # ------------------------------------------------------
 
         if pattern not in {
@@ -241,12 +365,13 @@ class PatternSentinel(BaseEngine):
         # SIGNAL VALUES
         # ======================================================
 
-        confidence = float(
+        confidence = self._safe_float(
             getattr(
                 signal,
                 "confidence",
                 0.0,
-            )
+            ),
+            default=0.0,
         )
 
         entry = getattr(
@@ -280,13 +405,8 @@ class PatternSentinel(BaseEngine):
             timestamp = candle.timestamp
 
         # ======================================================
-        # OPTIONAL STRUCTURE INFORMATION
+        # STRUCTURE
         # ======================================================
-        #
-        # These fields are useful for debugging live behaviour.
-        # If MWPatternEngine provides them, they will be included.
-        # Otherwise they remain None.
-        #
 
         high1 = getattr(
             signal,
@@ -306,26 +426,66 @@ class PatternSentinel(BaseEngine):
             None,
         )
 
-        low1 = getattr(
+        valley1 = getattr(
             signal,
-            "low1",
+            "valley1",
             None,
         )
 
-        peak = getattr(
+        high = getattr(
             signal,
-            "peak",
+            "high",
             None,
         )
 
-        low2 = getattr(
+        valley2 = getattr(
             signal,
-            "low2",
+            "valley2",
             None,
         )
 
         # ======================================================
-        # RETURN ALERT
+        # METRICS
+        # ======================================================
+
+        reversal_pct = getattr(
+            signal,
+            "reversal_pct",
+            None,
+        )
+
+        swing_distance_pct = getattr(
+            signal,
+            "swing_distance_pct",
+            None,
+        )
+
+        candle_distance = getattr(
+            signal,
+            "candle_distance",
+            None,
+        )
+
+        pivot_distance = getattr(
+            signal,
+            "pivot_distance",
+            None,
+        )
+
+        first_pivot_candle_id = getattr(
+            signal,
+            "first_pivot_candle_id",
+            None,
+        )
+
+        second_pivot_candle_id = getattr(
+            signal,
+            "second_pivot_candle_id",
+            None,
+        )
+
+        # ======================================================
+        # RETURN PAYLOAD
         # ======================================================
 
         return {
@@ -338,15 +498,32 @@ class PatternSentinel(BaseEngine):
             "stoploss": stoploss,
             "target": target,
             "timestamp": timestamp,
-            "candle_id": candle.candle_id,
-            # M structure
+            "candle_id": getattr(
+                candle,
+                "candle_id",
+                None,
+            ),
+            # --------------------------------------------------
+            # M STRUCTURE
+            # --------------------------------------------------
             "high1": high1,
             "valley": valley,
             "high2": high2,
-            # W structure
-            "low1": low1,
-            "peak": peak,
-            "low2": low2,
+            # --------------------------------------------------
+            # W STRUCTURE
+            # --------------------------------------------------
+            "valley1": valley1,
+            "high": high,
+            "valley2": valley2,
+            # --------------------------------------------------
+            # STRUCTURE METRICS
+            # --------------------------------------------------
+            "reversal_pct": reversal_pct,
+            "swing_distance_pct": swing_distance_pct,
+            "candle_distance": candle_distance,
+            "pivot_distance": pivot_distance,
+            "first_pivot_candle_id": first_pivot_candle_id,
+            "second_pivot_candle_id": second_pivot_candle_id,
         }
 
     # ==========================================================
@@ -357,39 +534,121 @@ class PatternSentinel(BaseEngine):
         self,
         payload: dict,
     ) -> str:
+        """
+        Build a structural alert key.
+
+        IMPORTANT:
+
+        candle_id alone is NOT sufficient.
+
+        A pattern can remain the same while several candles
+        arrive after the pattern has formed.
+
+        Therefore the two outer pivot candle IDs are used.
+
+        M:
+            HIGH1 candle + HIGH2 candle
+
+        W:
+            VALLEY1 candle + VALLEY2 candle
+        """
+
+        symbol = str(
+            payload.get(
+                "symbol",
+                "",
+            )
+        )
+
+        pattern = str(
+            payload.get(
+                "pattern",
+                "",
+            )
+        )
+
+        direction = str(
+            payload.get(
+                "direction",
+                "",
+            )
+        )
+
+        first_pivot = payload.get("first_pivot_candle_id")
+
+        second_pivot = payload.get("second_pivot_candle_id")
+
+        # ------------------------------------------------------
+        # Fallback for any legacy signal that does not expose
+        # pivot candle IDs.
+        # ------------------------------------------------------
+
+        if first_pivot is None:
+
+            first_pivot = payload.get(
+                "candle_id",
+                "",
+            )
+
+        if second_pivot is None:
+
+            second_pivot = payload.get(
+                "candle_id",
+                "",
+            )
 
         return "|".join(
             [
-                str(
-                    payload.get(
-                        "symbol",
-                    )
-                ),
-                str(
-                    payload.get(
-                        "pattern",
-                    )
-                ),
-                str(
-                    payload.get(
-                        "direction",
-                    )
-                ),
-                str(
-                    payload.get(
-                        "candle_id",
-                    )
-                ),
+                symbol,
+                pattern,
+                direction,
+                str(first_pivot),
+                str(second_pivot),
             ]
         )
+
+    # ==========================================================
+    # SAFE FLOAT
+    # ==========================================================
+
+    @staticmethod
+    def _safe_float(
+        value,
+        default: float = 0.0,
+    ) -> float:
+
+        try:
+
+            return float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return default
 
     # ==========================================================
     # RESET
     # ==========================================================
 
     def clear(self) -> None:
+        """
+        Reset Sentinel and underlying M/W engine.
+        """
 
-        self.engine.clear()
+        try:
+
+            self.engine.reset()
+
+        except Exception:
+
+            logger.exception("Failed to reset MWPatternEngine")
+
+            try:
+                self.engine.clear()
+            except Exception:
+                pass
 
         self._last_alert_key = None
 

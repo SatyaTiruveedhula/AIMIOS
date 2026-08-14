@@ -6,7 +6,7 @@ import json
 import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import RLock
 from typing import Callable, Deque, Dict, List, Optional
 
@@ -22,23 +22,39 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Candle:
+    """
+    Immutable OHLC candle.
+
+    CandleBuffer stores only COMPLETED candles in _history.
+
+    The currently forming candle is kept separately in
+    CandleBuffer._current.
+    """
+
     timestamp: datetime
+
     open: float
     high: float
     low: float
     close: float
+
     volume: float
     previous_close: float
+
     ticks: int
+
     cum_volume: float
     cum_price_volume: float
 
     change_pct: float = 0.0
     candle_id: int = 0
+
     body_strength: float = 0.0
     upper_wick_pct: float = 0.0
     lower_wick_pct: float = 0.0
+
     vwap: float = 0.0
+
     session_id: int = 1
     color: str = "DOJI"
 
@@ -76,13 +92,38 @@ class Candle:
 
 class CandleBuffer:
     """
-    Maintain rolling OHLC candle history for market instruments.
+    Rolling OHLC candle buffer.
 
-    Pattern detection is performed only on completed candles.
+    LIVE FLOW
+    ---------
 
-    A candle normally becomes completed when the next timeframe
-    bucket arrives. For historical replay/tests, finalize() can be
-    called explicitly to complete the final unfinished candle.
+        Kite tick
+            |
+            v
+        MarketSnapshot
+            |
+            v
+        CandleBuffer.update()
+            |
+            +---- current candle
+            |
+            +---- timeframe changes
+                       |
+                       v
+                 completed candle
+                       |
+             +---------+---------+
+             |                   |
+             v                   v
+        subscribers       PatternSentinel
+                               |
+                               v
+                         M/W detection
+
+    PatternSentinel receives COMPLETED candles only.
+
+    The currently forming candle is NEVER passed to
+    PatternSentinel.
     """
 
     def __init__(
@@ -103,62 +144,59 @@ class CandleBuffer:
 
         self._lock = RLock()
 
-        # ----------------------------------------------------
-        # Completed candles
-        # ----------------------------------------------------
+        # ====================================================
+        # COMPLETED CANDLES
+        # ====================================================
 
-        self._history: Dict[
-            str,
-            Deque[Candle],
-        ] = defaultdict(lambda: deque(maxlen=self.max_candles))
+        self._history: Dict[str, Deque[Candle]] = defaultdict(
+            lambda: deque(maxlen=self.max_candles)
+        )
 
-        # ----------------------------------------------------
-        # Current unfinished candle
-        # ----------------------------------------------------
+        # ====================================================
+        # CURRENT UNFINISHED CANDLE
+        # ====================================================
 
         self._current: Dict[str, Candle] = {}
 
-        # ----------------------------------------------------
-        # Previous cumulative market volume
-        # ----------------------------------------------------
+        # ====================================================
+        # LAST CUMULATIVE VOLUME
+        # ====================================================
 
         self._last_volume: Dict[str, float] = {}
 
-        # ----------------------------------------------------
-        # Cached highs/lows
-        # ----------------------------------------------------
+        # ====================================================
+        # HIGH / LOW CACHE
+        # ====================================================
 
-        self._high_cache: Dict[
-            str,
-            Deque[float],
-        ] = defaultdict(lambda: deque(maxlen=self.max_candles))
+        self._high_cache: Dict[str, Deque[float]] = defaultdict(
+            lambda: deque(maxlen=self.max_candles)
+        )
 
-        self._low_cache: Dict[
-            str,
-            Deque[float],
-        ] = defaultdict(lambda: deque(maxlen=self.max_candles))
+        self._low_cache: Dict[str, Deque[float]] = defaultdict(
+            lambda: deque(maxlen=self.max_candles)
+        )
 
-        # ----------------------------------------------------
-        # Sequential candle ID
-        # ----------------------------------------------------
+        # ====================================================
+        # CANDLE IDS
+        # ====================================================
 
         self._next_candle_id: Dict[str, int] = defaultdict(int)
 
-        # ----------------------------------------------------
-        # Session ID
-        # ----------------------------------------------------
+        # ====================================================
+        # SESSION IDS
+        # ====================================================
 
         self._session_id: Dict[str, int] = defaultdict(lambda: 1)
 
-        # ----------------------------------------------------
-        # Candle subscribers
-        # ----------------------------------------------------
+        # ====================================================
+        # NORMAL CANDLE SUBSCRIBERS
+        # ====================================================
 
         self._subscribers: List[Callable[[str, Candle], None]] = []
 
-        # ----------------------------------------------------
-        # M/W Pattern Sentinel
-        # ----------------------------------------------------
+        # ====================================================
+        # M/W PATTERN SENTINEL
+        # ====================================================
 
         self._pattern_sentinel = None
 
@@ -175,15 +213,15 @@ class CandleBuffer:
 
             self._pattern_sentinel = None
 
-        # ----------------------------------------------------
-        # Existing PatternDetector compatibility
-        # ----------------------------------------------------
+        # ====================================================
+        # EXISTING PATTERN DETECTOR
+        # ====================================================
 
         self._pattern_detector = pattern_detector
 
-        # ----------------------------------------------------
-        # Pattern subscribers
-        # ----------------------------------------------------
+        # ====================================================
+        # PATTERN SUBSCRIBERS
+        # ====================================================
 
         self._pattern_subscribers: List[Callable[[str, Dict[str, object]], None]] = []
 
@@ -202,8 +240,9 @@ class CandleBuffer:
         callback: Callable[[str, Candle], None],
     ) -> None:
 
-        if callback not in self._subscribers:
-            self._subscribers.append(callback)
+        with self._lock:
+            if callback not in self._subscribers:
+                self._subscribers.append(callback)
 
         logger.debug(
             "Subscriber added to CandleBuffer: %s",
@@ -215,8 +254,9 @@ class CandleBuffer:
         callback: Callable[[str, Candle], None],
     ) -> None:
 
-        if callback in self._subscribers:
-            self._subscribers.remove(callback)
+        with self._lock:
+            if callback in self._subscribers:
+                self._subscribers.remove(callback)
 
         logger.debug(
             "Subscriber removed from CandleBuffer: %s",
@@ -231,8 +271,9 @@ class CandleBuffer:
         ],
     ) -> None:
 
-        if callback not in self._pattern_subscribers:
-            self._pattern_subscribers.append(callback)
+        with self._lock:
+            if callback not in self._pattern_subscribers:
+                self._pattern_subscribers.append(callback)
 
         logger.debug(
             "Pattern subscriber added: %s",
@@ -247,8 +288,9 @@ class CandleBuffer:
         ],
     ) -> None:
 
-        if callback in self._pattern_subscribers:
-            self._pattern_subscribers.remove(callback)
+        with self._lock:
+            if callback in self._pattern_subscribers:
+                self._pattern_subscribers.remove(callback)
 
         logger.debug(
             "Pattern subscriber removed: %s",
@@ -277,19 +319,17 @@ class CandleBuffer:
         candle: Candle,
     ) -> None:
 
-        for subscriber in list(self._subscribers):
+        subscribers = list(self._subscribers)
 
+        for subscriber in subscribers:
             try:
                 subscriber(
                     instrument_id,
                     candle,
                 )
 
-            except Exception as exc:
-                logger.exception(
-                    "CandleBuffer subscriber failed: %s",
-                    exc,
-                )
+            except Exception:
+                logger.exception("CandleBuffer subscriber failed")
 
     # ========================================================
     # PUBLISH PATTERN
@@ -304,19 +344,17 @@ class CandleBuffer:
         if not patterns:
             return
 
-        for subscriber in list(self._pattern_subscribers):
+        subscribers = list(self._pattern_subscribers)
 
+        for subscriber in subscribers:
             try:
                 subscriber(
                     instrument_id,
                     patterns,
                 )
 
-            except Exception as exc:
-                logger.exception(
-                    "Pattern subscriber failed: %s",
-                    exc,
-                )
+            except Exception:
+                logger.exception("Pattern subscriber failed")
 
     # ========================================================
     # UPDATE
@@ -326,27 +364,47 @@ class CandleBuffer:
         self,
         snapshot: MarketSnapshot,
     ) -> None:
+        """
+        Process one market tick.
 
-        instrument_id = snapshot.symbol
+        The tick updates the current candle.
+
+        When the timestamp enters a new timeframe bucket,
+        the previous candle is completed and passed through
+        the completed-candle processing pipeline.
+        """
+
+        if snapshot is None:
+            return
+
+        instrument_id = str(snapshot.symbol)
+
+        if not instrument_id:
+            return
 
         bucket_time = self._align_timestamp(snapshot.timestamp)
 
-        volume_delta = self._calculate_volume_delta(
-            instrument_id,
-            snapshot.volume,
-        )
-
         with self._lock:
+
+            volume_delta = self._calculate_volume_delta(
+                instrument_id,
+                snapshot.volume,
+            )
 
             current = self._current.get(instrument_id)
 
-            # ------------------------------------------------
-            # NEW TIMEFRAME / NEW CANDLE
-            # ------------------------------------------------
+            # =================================================
+            # NEW TIMEFRAME
+            # =================================================
 
             if current is not None and bucket_time != current.timestamp:
 
                 completed = current
+
+                self._current.pop(
+                    instrument_id,
+                    None,
+                )
 
                 self._append_candle(
                     instrument_id,
@@ -367,18 +425,20 @@ class CandleBuffer:
 
                 current = None
 
-            # ------------------------------------------------
+            # =================================================
             # CREATE NEW CANDLE
-            # ------------------------------------------------
+            # =================================================
 
             if current is None:
 
-                self._current[instrument_id] = self._create_candle(
+                new_candle = self._create_candle(
                     instrument_id=instrument_id,
                     timestamp=bucket_time,
-                    ltp=snapshot.ltp,
+                    ltp=float(snapshot.ltp),
                     volume_delta=volume_delta,
                 )
+
+                self._current[instrument_id] = new_candle
 
                 logger.debug(
                     "Started candle "
@@ -388,19 +448,19 @@ class CandleBuffer:
                     "session_id=%s",
                     instrument_id,
                     bucket_time,
-                    self._current[instrument_id].candle_id,
-                    self._current[instrument_id].session_id,
+                    new_candle.candle_id,
+                    new_candle.session_id,
                 )
 
                 return
 
-            # ------------------------------------------------
+            # =================================================
             # UPDATE CURRENT CANDLE
-            # ------------------------------------------------
+            # =================================================
 
             self._current[instrument_id] = self._update_candle(
                 current=current,
-                ltp=snapshot.ltp,
+                ltp=float(snapshot.ltp),
                 volume_delta=volume_delta,
             )
 
@@ -413,10 +473,11 @@ class CandleBuffer:
         instrument_id: str,
         candle: Candle,
     ) -> None:
+        """
+        Store and process ONE completed candle.
 
-        # ----------------------------------------------------
-        # STORE COMPLETED CANDLE
-        # ----------------------------------------------------
+        PatternSentinel receives the completed history only.
+        """
 
         self._history[instrument_id].append(candle)
 
@@ -424,18 +485,18 @@ class CandleBuffer:
 
         self._low_cache[instrument_id].append(candle.low)
 
-        # ----------------------------------------------------
-        # PUBLISH COMPLETED CANDLE
-        # ----------------------------------------------------
+        # ====================================================
+        # NORMAL CANDLE SUBSCRIBERS
+        # ====================================================
 
         self._publish(
             instrument_id,
             candle,
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # M/W PATTERN SENTINEL
-        # ----------------------------------------------------
+        # ====================================================
 
         if self._pattern_sentinel is not None:
 
@@ -443,39 +504,43 @@ class CandleBuffer:
 
                 completed_candles = list(self._history[instrument_id])
 
-                sentinel_result = self._pattern_sentinel.process_candle(
-                    candle=candle,
-                    candles=completed_candles,
-                    symbol=instrument_id,
-                )
+                if len(completed_candles) >= 7:
 
-                if sentinel_result:
-
-                    logger.info(
-                        "M/W SENTINEL ALERT | " "symbol=%s | result=%s",
-                        instrument_id,
-                        sentinel_result,
+                    sentinel_result = self._pattern_sentinel.process_candle(
+                        candle=candle,
+                        candles=completed_candles,
+                        symbol=instrument_id,
                     )
 
-                    self._publish_pattern(
-                        instrument_id,
-                        sentinel_result,
-                    )
+                    if sentinel_result:
+
+                        logger.warning(
+                            "M/W SENTINEL ALERT | "
+                            "symbol=%s | pattern=%s | "
+                            "direction=%s | confidence=%s",
+                            instrument_id,
+                            sentinel_result.get("pattern"),
+                            sentinel_result.get("direction"),
+                            sentinel_result.get("confidence"),
+                        )
+
+                        self._publish_pattern(
+                            instrument_id,
+                            sentinel_result,
+                        )
 
             except Exception:
 
                 logger.exception(
-                    "M/W Pattern Sentinel failed " "for %s",
+                    "M/W Pattern Sentinel failed for %s",
                     instrument_id,
                 )
 
-        # ----------------------------------------------------
+        # ====================================================
         # EXISTING PATTERN DETECTION
-        # ----------------------------------------------------
+        # ====================================================
 
-        self._run_pattern_detection(
-            instrument_id,
-        )
+        self._run_pattern_detection(instrument_id)
 
     # ========================================================
     # EXISTING PATTERN DETECTION
@@ -485,17 +550,20 @@ class CandleBuffer:
         self,
         instrument_id: str,
     ) -> None:
+        """
+        Run the existing pattern engines.
 
-        # Only completed candles are passed to detectors.
+        Only completed candles are supplied.
+        """
 
         recent_candles = list(self._history[instrument_id])[-100:]
 
         if not recent_candles:
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # EXISTING PatternDetector
-        # ----------------------------------------------------
+        # ====================================================
 
         if self._pattern_detector is not None:
 
@@ -526,9 +594,9 @@ class CandleBuffer:
                     exc,
                 )
 
-        # ----------------------------------------------------
+        # ====================================================
         # PATTERN RECOGNITION ENGINE
-        # ----------------------------------------------------
+        # ====================================================
 
         try:
 
@@ -620,7 +688,7 @@ class CandleBuffer:
             )
 
     # ========================================================
-    # FINALIZE CURRENT CANDLE
+    # FINALIZE
     # ========================================================
 
     def finalize(
@@ -628,23 +696,16 @@ class CandleBuffer:
         instrument_id: Optional[str] = None,
     ) -> None:
         """
-        Finalize the currently unfinished candle.
+        Finalize the current unfinished candle.
 
-        Used for:
+        Used by:
         - historical replay
-        - unit tests
-        - end-of-session processing
-        - graceful shutdown
-
-        The finalized candle follows the same processing path
-        as a candle completed by arrival of the next timeframe.
+        - testing
+        - shutdown
+        - end of session
         """
 
         with self._lock:
-
-            # ------------------------------------------------
-            # FINALIZE ALL INSTRUMENTS
-            # ------------------------------------------------
 
             if instrument_id is None:
 
@@ -665,11 +726,17 @@ class CandleBuffer:
                         current,
                     )
 
-                return
+                    logger.debug(
+                        "Finalized candle "
+                        "instrument=%s "
+                        "timestamp=%s "
+                        "candle_id=%s",
+                        symbol,
+                        current.timestamp,
+                        current.candle_id,
+                    )
 
-            # ------------------------------------------------
-            # FINALIZE ONE INSTRUMENT
-            # ------------------------------------------------
+                return
 
             current = self._current.pop(
                 instrument_id,
@@ -685,10 +752,7 @@ class CandleBuffer:
             )
 
             logger.debug(
-                "Finalized current candle "
-                "instrument=%s "
-                "timestamp=%s "
-                "candle_id=%s",
+                "Finalized candle " "instrument=%s " "timestamp=%s " "candle_id=%s",
                 instrument_id,
                 current.timestamp,
                 current.candle_id,
@@ -713,7 +777,7 @@ class CandleBuffer:
         self._next_candle_id[instrument_id] = candle_id
 
         volume_delta = max(
-            volume_delta,
+            float(volume_delta),
             0.0,
         )
 
@@ -721,15 +785,27 @@ class CandleBuffer:
 
         cum_price_volume = volume_delta * ltp
 
-        change_pct = (
-            0.0
-            if previous_close == 0.0
-            else ((ltp - previous_close) / previous_close) * 100.0
-        )
+        if previous_close == 0.0:
+
+            change_pct = 0.0
+
+        else:
+
+            change_pct = ((ltp - previous_close) / previous_close) * 100.0
 
         vwap = ltp
 
-        color = "GREEN"
+        if ltp > previous_close and previous_close != 0.0:
+
+            color = "GREEN"
+
+        elif ltp < previous_close and previous_close != 0.0:
+
+            color = "RED"
+
+        else:
+
+            color = "DOJI"
 
         (
             body_strength,
@@ -777,7 +853,7 @@ class CandleBuffer:
     ) -> Candle:
 
         volume_delta = max(
-            volume_delta,
+            float(volume_delta),
             0.0,
         )
 
@@ -795,11 +871,15 @@ class CandleBuffer:
 
         cum_price_volume = current.cum_price_volume + volume_delta * ltp
 
-        change_pct = (
-            0.0
-            if current.previous_close == 0.0
-            else ((ltp - current.previous_close) / current.previous_close) * 100.0
-        )
+        if current.previous_close == 0.0:
+
+            change_pct = 0.0
+
+        else:
+
+            change_pct = (
+                (ltp - current.previous_close) / current.previous_close
+            ) * 100.0
 
         (
             body_strength,
@@ -812,23 +892,32 @@ class CandleBuffer:
             ltp,
         )
 
-        # ----------------------------------------------------
-        # VWAP
-        # ----------------------------------------------------
+        # ====================================================
+        # TRUE VOLUME WEIGHTED PRICE
+        # ====================================================
 
-        vwap = (high + low + ltp) / 3.0
+        if cum_volume > 0.0:
 
-        # ----------------------------------------------------
-        # CANDLE COLOR
-        # ----------------------------------------------------
+            vwap = cum_price_volume / cum_volume
+
+        else:
+
+            vwap = (high + low + ltp) / 3.0
+
+        # ====================================================
+        # COLOR
+        # ====================================================
 
         if ltp > current.open:
+
             color = "GREEN"
 
         elif ltp < current.open:
+
             color = "RED"
 
         else:
+
             color = "DOJI"
 
         return Candle(
@@ -898,11 +987,7 @@ class CandleBuffer:
 
         upper_wick_pct = (
             max(
-                high
-                - max(
-                    open_price,
-                    close,
-                ),
+                high - max(open_price, close),
                 0.0,
             )
             / range_value
@@ -910,11 +995,7 @@ class CandleBuffer:
 
         lower_wick_pct = (
             max(
-                min(
-                    open_price,
-                    close,
-                )
-                - low,
+                min(open_price, close) - low,
                 0.0,
             )
             / range_value
@@ -1254,9 +1335,11 @@ class CandleBuffer:
                 if self._pattern_sentinel is not None:
 
                     try:
+
                         self._pattern_sentinel.clear()
 
                     except Exception:
+
                         logger.exception("Failed to reset " "M/W PatternSentinel")
 
                 logger.info("Cleared candle history " "for all instruments")
@@ -1312,19 +1395,15 @@ class CandleBuffer:
         instrument_id: Optional[str] = None,
     ) -> None:
         """
-        Discard the unfinished candle and start
-        a new logical session.
+        Start a new logical session.
 
         Completed candle history is preserved.
 
+        Current unfinished candles are discarded.
+
         Candle IDs continue increasing.
 
-        Session IDs increment:
-
-            initial session = 1
-            reset_session() = 2
-            reset_session() = 3
-            ...
+        Session IDs increment.
         """
 
         with self._lock:
@@ -1338,11 +1417,12 @@ class CandleBuffer:
                 instrument_ids.update(self._session_id.keys())
 
                 for symbol in instrument_ids:
+
                     self._session_id[symbol] += 1
 
                 self._current.clear()
 
-                logger.info("Reset session for all instruments")
+                logger.info("Reset session " "for all instruments")
 
                 return
 
@@ -1360,7 +1440,7 @@ class CandleBuffer:
             )
 
     # ========================================================
-    # CURRENT SESSION ID
+    # SESSION ID
     # ========================================================
 
     def get_session_id(
@@ -1369,6 +1449,7 @@ class CandleBuffer:
     ) -> int:
 
         with self._lock:
+
             return self._session_id[instrument_id]
 
     # ========================================================
@@ -1419,22 +1500,48 @@ class CandleBuffer:
         volume: float,
     ) -> float:
 
+        try:
+
+            volume = float(volume)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            volume = 0.0
+
+        if volume < 0.0:
+            volume = 0.0
+
         previous = self._last_volume.get(instrument_id)
 
         self._last_volume[instrument_id] = volume
 
         if previous is None:
-            return max(
-                volume,
-                0.0,
-            )
+            return volume
+
+        # ====================================================
+        # NORMAL CUMULATIVE VOLUME
+        # ====================================================
 
         delta = volume - previous
 
-        return max(
-            delta,
-            0.0,
+        if delta >= 0.0:
+            return delta
+
+        # ====================================================
+        # VOLUME RESET
+        # ====================================================
+
+        logger.debug(
+            "Volume reset detected " "for %s: previous=%s current=%s",
+            instrument_id,
+            previous,
+            volume,
         )
+
+        return volume
 
     # ========================================================
     # TIMESTAMP ALIGNMENT
@@ -1445,35 +1552,45 @@ class CandleBuffer:
         timestamp: datetime,
     ) -> datetime:
         """
-        Align incoming market timestamp to the
-        configured candle timeframe.
+        Align timestamp to the configured candle timeframe.
 
-        The timestamp's timezone is preserved.
+        KiteLiveFeed converts incoming timestamps to UTC.
 
-        If the broker/feed supplies Asia/Kolkata
-        timestamps, candle timestamps remain
-        Asia/Kolkata.
+        Therefore an aware UTC timestamp remains UTC.
 
-        We do NOT convert timestamps to UTC here.
+        Naive timestamps are treated as UTC.
+
+        No local-machine timezone conversion is performed.
         """
+
+        if timestamp is None:
+
+            timestamp = datetime.now(timezone.utc)
+
+        # ====================================================
+        # AWARE TIMESTAMP
+        # ====================================================
 
         if timestamp.tzinfo is not None:
 
-            epoch_seconds = timestamp.timestamp()
+            epoch_seconds = int(timestamp.timestamp())
 
-            bucket_seconds = int(epoch_seconds) - (int(epoch_seconds) % self.timeframe)
+            bucket_seconds = epoch_seconds - (epoch_seconds % self.timeframe)
 
             return datetime.fromtimestamp(
                 bucket_seconds,
-                tz=timestamp.tzinfo,
+                tz=timezone.utc,
             )
 
-        # If feed gives a naive timestamp,
-        # preserve it as naive instead of
-        # silently applying the machine timezone.
+        # ====================================================
+        # NAIVE TIMESTAMP
+        # ====================================================
 
-        seconds = int(timestamp.timestamp())
+        epoch_seconds = int(timestamp.replace(tzinfo=timezone.utc).timestamp())
 
-        bucket = seconds - (seconds % self.timeframe)
+        bucket_seconds = epoch_seconds - (epoch_seconds % self.timeframe)
 
-        return datetime.fromtimestamp(bucket)
+        return datetime.fromtimestamp(
+            bucket_seconds,
+            tz=timezone.utc,
+        )
