@@ -1,655 +1,956 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
-from .engine import BaseEngine
-from .mw_pattern_engine import MWPatternEngine
-from aimios.market.candle_buffer import Candle
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
-class PatternSentinel(BaseEngine):
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Required first-leg reversal.
+#
+# M:
+#   HIGH1 -> VALLEY
+#
+# W:
+#   LOW1 -> PEAK
+#
+# Minimum = 0.13%
+MIN_REVERSAL_PCT = 0.13
+
+# Required difference between outer points.
+#
+# M:
+#   HIGH1 must be higher than HIGH2 by at least 0.03%
+#
+# W:
+#   LOW2 must be higher than LOW1 by at least 0.03%
+#
+MIN_OUTER_DIFFERENCE_PCT = 0.03
+
+# Minimum number of candles between the two
+# outer points.
+#
+# IMPORTANT:
+# If HIGH1 candle_id = 10
+# and HIGH2 candle_id = 17
+#
+# separation = 7 candles
+#
+MIN_OUTER_CANDLE_SEPARATION = 7
+
+# Number of candles on each side required to
+# identify a local pivot.
+#
+# A pivot is therefore confirmed only after candles
+# following the pivot have completed.
+PIVOT_LEFT = 1
+PIVOT_RIGHT = 1
+
+# Search window.
+MAX_PATTERN_CANDLES = 100
+
+# Prevent the same pattern from repeatedly generating
+# alerts on every subsequent completed candle.
+MAX_ALERT_HISTORY = 1000
+
+
+# ============================================================
+# PIVOT
+# ============================================================
+
+
+@dataclass(frozen=True)
+class Pivot:
+    index: int
+    candle_id: int
+    timestamp: datetime
+    price: float
+    kind: str
+
+    # "HIGH" or "LOW"
+
+
+# ============================================================
+# PATTERN SENTINEL
+# ============================================================
+
+
+class PatternSentinel:
     """
-    Live M/W pattern watcher.
+    Detects only the requested M/W pattern.
 
-    Flow:
+    M:
 
-        completed Candle
-              ↓
-        CandleBuffer
-              ↓
-        PatternSentinel
-              ↓
-        MWPatternEngine
-              ↓
-        BUY / SELL alert
-
-    IMPORTANT
-    ---------
-    Only completed candles must be supplied to process_candle().
-
-    M RULES
-    -------
         HIGH1
-           |
-           | >= 0.13%
-           |
-        VALLEY
-           |
-           | recovery
-           |
-        HIGH2
+           /\
+          /  \
+         /    \
+                HIGH2
+                /\
+               /  \
+              /
 
         HIGH1 -> VALLEY >= 0.13%
-        HIGH1 vs HIGH2 <= 0.03%
+
+        HIGH1 > HIGH2 by >= 0.03%
+
         HIGH1 -> HIGH2 >= 7 candles
 
-    W RULES
-    -------
-        VALLEY1
-           |
-           | >= 0.13%
-           |
-          HIGH
-           |
-           | pullback
-           |
-        VALLEY2
+        RESULT = SELL
 
-        VALLEY1 -> HIGH >= 0.13%
-        VALLEY1 vs VALLEY2 <= 0.03%
-        VALLEY1 -> VALLEY2 >= 7 candles
+
+    W:
+
+        LOW1
+          \    /
+           \  /
+            \/
+            PEAK
+              \
+               \
+                LOW2
+
+        LOW1 -> PEAK >= 0.13%
+
+        LOW2 > LOW1 by >= 0.03%
+
+        LOW1 -> LOW2 >= 7 candles
+
+        RESULT = BUY
+
+
+    Detection is performed only using completed candles.
+
+    CandleBuffer already guarantees this by calling:
+
+        process_candle(
+            candle=completed_candle,
+            candles=completed_candles,
+            symbol=instrument_id,
+        )
     """
 
-    name = "PatternSentinel"
+    def __init__(self) -> None:
 
-    def __init__(
-        self,
-        app=None,
-        alert_callback: Optional[Callable[[dict], None]] = None,
-        **kwargs,
-    ) -> None:
+        self._alert_history: Dict[
+            str,
+            List[Tuple[str, int, int]],
+        ] = {}
 
-        super().__init__(app)
+        logger.info(
+            "PatternSentinel initialized | "
+            "M/W | reversal=%.2f%% | "
+            "outer_difference=%.2f%% | "
+            "min_separation=%d candles",
+            MIN_REVERSAL_PCT,
+            MIN_OUTER_DIFFERENCE_PCT,
+            MIN_OUTER_CANDLE_SEPARATION,
+        )
 
-        # ------------------------------------------------------
-        # M/W ENGINE
-        # ------------------------------------------------------
-
-        self.engine = MWPatternEngine()
-
-        # ------------------------------------------------------
-        # ALERT CALLBACK
-        # ------------------------------------------------------
-
-        self.alert_callback = alert_callback
-
-        # ------------------------------------------------------
-        # DUPLICATE PROTECTION
-        #
-        # Keep the complete structural identity of the last
-        # alert instead of only the latest candle.
-        # ------------------------------------------------------
-
-        self._last_alert_key: Optional[str] = None
-
-        self._started = False
-
-    # ==========================================================
+    # ========================================================
     # START
-    # ==========================================================
+    # ========================================================
 
     def start(self) -> None:
+        """
+        Kept for compatibility with CandleBuffer.
 
-        if self._started:
-            return
+        PatternSentinel does not require a background thread.
+        Detection happens synchronously when a completed
+        candle is received.
+        """
 
-        super().start()
+        logger.info("PatternSentinel started")
 
-        self._started = True
+    # ========================================================
+    # CLEAR
+    # ========================================================
 
-        logger.info("Pattern Sentinel Started")
+    def clear(self) -> None:
 
-    # ==========================================================
-    # STOP
-    # ==========================================================
+        self._alert_history.clear()
 
-    def stop(self) -> None:
+        logger.info("PatternSentinel cleared")
 
-        if not self._started:
-            return
-
-        self._started = False
-
-        super().stop()
-
-        logger.info("Pattern Sentinel Stopped")
-
-    # ==========================================================
-    # PROCESS COMPLETED CANDLE
-    # ==========================================================
+    # ========================================================
+    # PROCESS CANDLE
+    # ========================================================
 
     def process_candle(
         self,
-        candle: Candle,
-        candles: List[Candle],
+        candle,
+        candles,
         symbol: str,
-    ) -> Optional[dict]:
+    ) -> Optional[Dict[str, object]]:
         """
         Process one newly completed candle.
 
-        candles:
-            Completed candles only.
-
-        candle:
-            The newly completed candle.
-
         Returns:
-            Alert payload if a NEW M/W pattern is detected.
-            None otherwise.
+
+            None
+                No new pattern.
+
+            dict
+                M/W alert.
         """
 
-        if not self._started:
+        if candle is None:
             return None
-
-        # ------------------------------------------------------
-        # Need enough completed candles.
-        #
-        # Minimum outer-pivot distance is 7 candles.
-        # ------------------------------------------------------
-
-        if len(candles) < 8:
-            return None
-
-        # ------------------------------------------------------
-        # Make sure the supplied candle is actually the latest
-        # completed candle.
-        # ------------------------------------------------------
 
         if not candles:
             return None
 
-        latest_candle = candles[-1]
-
-        if getattr(
-            latest_candle,
-            "candle_id",
-            None,
-        ) != getattr(
-            candle,
-            "candle_id",
-            None,
-        ):
-            logger.warning(
-                "PatternSentinel received candle that is "
-                "not the latest completed candle | "
-                "symbol=%s | candle_id=%s | latest_id=%s",
-                symbol,
-                getattr(candle, "candle_id", None),
-                getattr(latest_candle, "candle_id", None),
-            )
-
+        if not symbol:
             return None
 
-        # ======================================================
-        # RUN M/W ENGINE
-        # ======================================================
+        # ----------------------------------------------------
+        # ONLY COMPLETED CANDLES
+        #
+        # CandleBuffer passes completed history.
+        # Make a defensive list so the detector never
+        # modifies CandleBuffer's deque.
+        # ----------------------------------------------------
 
-        try:
+        completed = list(candles)
 
-            signal = self.engine.detect(
-                candles,
-                symbol=symbol,
-            )
-
-        except Exception:
-
-            logger.exception(
-                "MWPatternEngine failed for %s",
-                symbol,
-            )
-
+        if len(completed) < 3:
             return None
 
-        if signal is None:
+        # ----------------------------------------------------
+        # Use only the most recent search window.
+        # ----------------------------------------------------
+
+        if len(completed) > MAX_PATTERN_CANDLES:
+            completed = completed[-MAX_PATTERN_CANDLES:]
+
+        # ----------------------------------------------------
+        # The newly completed candle should be the latest
+        # candle supplied by CandleBuffer.
+        # ----------------------------------------------------
+
+        latest = completed[-1]
+
+        # ----------------------------------------------------
+        # We need at least enough candles to create
+        # the outer 7-candle separation.
+        # ----------------------------------------------------
+
+        if len(completed) < (MIN_OUTER_CANDLE_SEPARATION + 1):
             return None
 
-        # ======================================================
-        # BUILD ALERT
-        # ======================================================
+        # ----------------------------------------------------
+        # Find confirmed pivots.
+        # ----------------------------------------------------
 
-        payload = self._build_alert(
-            signal=signal,
-            candle=candle,
+        high_pivots = self._find_high_pivots(completed)
+
+        low_pivots = self._find_low_pivots(completed)
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # We evaluate M first and W second.
+        #
+        # The pattern must terminate at the latest
+        # completed candle / latest confirmed pivot.
+        # ----------------------------------------------------
+
+        m_alert = self._detect_m(
+            completed=completed,
+            high_pivots=high_pivots,
+            low_pivots=low_pivots,
             symbol=symbol,
+            latest=latest,
         )
 
-        if payload is None:
+        if m_alert is not None:
+            return m_alert
+
+        w_alert = self._detect_w(
+            completed=completed,
+            low_pivots=low_pivots,
+            high_pivots=high_pivots,
+            symbol=symbol,
+            latest=latest,
+        )
+
+        if w_alert is not None:
+            return w_alert
+
+        return None
+
+    # ========================================================
+    # M DETECTION
+    # ========================================================
+
+    def _detect_m(
+        self,
+        completed,
+        high_pivots: List[Pivot],
+        low_pivots: List[Pivot],
+        symbol: str,
+        latest,
+    ) -> Optional[Dict[str, object]]:
+        """
+        Detect:
+
+            HIGH1 -> VALLEY -> HIGH2
+
+        Conditions:
+
+            HIGH1 -> VALLEY >= 0.13%
+
+            HIGH1 > HIGH2 by >= 0.03%
+
+            HIGH1 -> HIGH2 >= 7 candles
+
+        Alert is generated when HIGH2 is confirmed.
+        """
+
+        if len(high_pivots) < 2:
             return None
 
-        # ======================================================
-        # DUPLICATE PROTECTION
-        # ======================================================
+        # ----------------------------------------------------
+        # Work backwards so the newest completed M gets
+        # priority.
+        # ----------------------------------------------------
 
-        alert_key = self._make_alert_key(
-            payload,
-        )
+        for high2 in reversed(high_pivots):
 
-        if alert_key == self._last_alert_key:
+            # HIGH2 must be the latest confirmed high pivot.
+            #
+            # This prevents an old M from generating an alert
+            # again when a newer candle arrives.
+            if high2.index >= len(completed) - PIVOT_RIGHT:
+                pass
+            else:
+                continue
 
-            logger.debug(
-                "Duplicate M/W signal ignored | " "symbol=%s | key=%s",
-                symbol,
-                alert_key,
-            )
+            # ------------------------------------------------
+            # Need HIGH1 before HIGH2.
+            # ------------------------------------------------
 
-            return None
+            previous_highs = [h for h in high_pivots if h.index < high2.index]
 
-        # ------------------------------------------------------
-        # Save new alert key.
-        # ------------------------------------------------------
+            if not previous_highs:
+                continue
 
-        self._last_alert_key = alert_key
+            # ------------------------------------------------
+            # Use the nearest valid HIGH1 first.
+            # ------------------------------------------------
 
-        # ======================================================
-        # LOG ALERT
-        # ======================================================
+            for high1 in reversed(previous_highs):
 
-        logger.warning(
-            "MW ALERT | %s | "
-            "pattern=%s | "
-            "direction=%s | "
-            "confidence=%.1f | "
-            "entry=%s | "
-            "stoploss=%s | "
-            "target=%s | "
-            "high1=%s | "
-            "valley=%s | "
-            "high2=%s | "
-            "valley1=%s | "
-            "high=%s | "
-            "valley2=%s",
-            symbol,
-            payload["pattern"],
-            payload["direction"],
-            payload["confidence"],
-            payload.get("entry"),
-            payload.get("stoploss"),
-            payload.get("target"),
-            payload.get("high1"),
-            payload.get("valley"),
-            payload.get("high2"),
-            payload.get("valley1"),
-            payload.get("high"),
-            payload.get("valley2"),
-        )
+                separation = high2.candle_id - high1.candle_id
 
-        # ======================================================
-        # CALLBACK
-        # ======================================================
+                if separation < (MIN_OUTER_CANDLE_SEPARATION):
+                    continue
 
-        if self.alert_callback is not None:
+                # ------------------------------------------------
+                # There must be a valley between HIGH1 and HIGH2.
+                # ------------------------------------------------
 
-            try:
+                valleys = [
+                    low for low in low_pivots if (high1.index < low.index < high2.index)
+                ]
 
-                self.alert_callback(
-                    payload,
+                if not valleys:
+                    continue
+
+                # ------------------------------------------------
+                # Find the deepest valley between the two highs.
+                # ------------------------------------------------
+
+                valley = min(
+                    valleys,
+                    key=lambda x: x.price,
                 )
 
-            except Exception:
+                # ------------------------------------------------
+                # HIGH1 -> VALLEY percentage.
+                # ------------------------------------------------
 
-                logger.exception("Pattern Sentinel alert callback failed")
+                reversal_pct = self._down_pct(
+                    high1.price,
+                    valley.price,
+                )
 
-        return payload
+                if reversal_pct < (MIN_REVERSAL_PCT):
+                    continue
 
-    # ==========================================================
+                # ------------------------------------------------
+                # HIGH1 must be higher than HIGH2
+                # by at least 0.03%.
+                #
+                # Example:
+                #
+                # HIGH1 = 100
+                #
+                # HIGH2 must be <= 99.97
+                # ------------------------------------------------
+
+                high_difference_pct = self._difference_pct(
+                    high1.price,
+                    high2.price,
+                )
+
+                if high1.price <= high2.price:
+                    continue
+
+                if high_difference_pct < (MIN_OUTER_DIFFERENCE_PCT):
+                    continue
+
+                # ------------------------------------------------
+                # Make sure HIGH2 is genuinely after the valley.
+                # ------------------------------------------------
+
+                if not (high1.index < valley.index < high2.index):
+                    continue
+
+                # ------------------------------------------------
+                # Duplicate protection.
+                # ------------------------------------------------
+
+                if self._already_alerted(
+                    symbol=symbol,
+                    pattern="M",
+                    outer1=high1.candle_id,
+                    outer2=high2.candle_id,
+                ):
+                    continue
+
+                return self._build_alert(
+                    pattern="M",
+                    direction="SELL",
+                    symbol=symbol,
+                    high1=high1,
+                    valley=valley,
+                    high2=high2,
+                    reversal_pct=reversal_pct,
+                    outer_difference_pct=(high_difference_pct),
+                    separation=separation,
+                    entry=float(latest.close),
+                )
+
+        return None
+
+    # ========================================================
+    # W DETECTION
+    # ========================================================
+
+    def _detect_w(
+        self,
+        completed,
+        low_pivots: List[Pivot],
+        high_pivots: List[Pivot],
+        symbol: str,
+        latest,
+    ) -> Optional[Dict[str, object]]:
+        """
+        Detect:
+
+            LOW1 -> PEAK -> LOW2
+
+        Conditions:
+
+            LOW1 -> PEAK >= 0.13%
+
+            LOW2 > LOW1 by >= 0.03%
+
+            LOW1 -> LOW2 >= 7 candles
+
+        Alert is generated when LOW2 is confirmed.
+        """
+
+        if len(low_pivots) < 2:
+            return None
+
+        # ----------------------------------------------------
+        # Newest LOW2 first.
+        # ----------------------------------------------------
+
+        for low2 in reversed(low_pivots):
+
+            # LOW2 must be the latest confirmed low pivot.
+            if low2.index >= len(completed) - PIVOT_RIGHT:
+                pass
+            else:
+                continue
+
+            previous_lows = [low for low in low_pivots if low.index < low2.index]
+
+            if not previous_lows:
+                continue
+
+            # ------------------------------------------------
+            # Nearest LOW1 first.
+            # ------------------------------------------------
+
+            for low1 in reversed(previous_lows):
+
+                separation = low2.candle_id - low1.candle_id
+
+                if separation < (MIN_OUTER_CANDLE_SEPARATION):
+                    continue
+
+                # ------------------------------------------------
+                # Need a peak between LOW1 and LOW2.
+                # ------------------------------------------------
+
+                peaks = [
+                    high
+                    for high in high_pivots
+                    if (low1.index < high.index < low2.index)
+                ]
+
+                if not peaks:
+                    continue
+
+                # ------------------------------------------------
+                # Highest peak between LOW1 and LOW2.
+                # ------------------------------------------------
+
+                peak = max(
+                    peaks,
+                    key=lambda x: x.price,
+                )
+
+                # ------------------------------------------------
+                # LOW1 -> PEAK percentage.
+                # ------------------------------------------------
+
+                reversal_pct = self._up_pct(
+                    low1.price,
+                    peak.price,
+                )
+
+                if reversal_pct < (MIN_REVERSAL_PCT):
+                    continue
+
+                # ------------------------------------------------
+                # LOW2 must be higher than LOW1
+                # by at least 0.03%.
+                #
+                # Example:
+                #
+                # LOW1 = 100
+                #
+                # LOW2 must be >= 100.03
+                # ------------------------------------------------
+
+                low_difference_pct = self._difference_pct(
+                    low2.price,
+                    low1.price,
+                )
+
+                if low2.price <= low1.price:
+                    continue
+
+                if low_difference_pct < (MIN_OUTER_DIFFERENCE_PCT):
+                    continue
+
+                # ------------------------------------------------
+                # Correct ordering.
+                # ------------------------------------------------
+
+                if not (low1.index < peak.index < low2.index):
+                    continue
+
+                # ------------------------------------------------
+                # Duplicate protection.
+                # ------------------------------------------------
+
+                if self._already_alerted(
+                    symbol=symbol,
+                    pattern="W",
+                    outer1=low1.candle_id,
+                    outer2=low2.candle_id,
+                ):
+                    continue
+
+                return self._build_alert(
+                    pattern="W",
+                    direction="BUY",
+                    symbol=symbol,
+                    low1=low1,
+                    peak=peak,
+                    low2=low2,
+                    reversal_pct=reversal_pct,
+                    outer_difference_pct=(low_difference_pct),
+                    separation=separation,
+                    entry=float(latest.close),
+                )
+
+        return None
+
+    # ========================================================
+    # HIGH PIVOTS
+    # ========================================================
+
+    @staticmethod
+    def _find_high_pivots(
+        candles,
+    ) -> List[Pivot]:
+
+        pivots: List[Pivot] = []
+
+        total = len(candles)
+
+        for i in range(
+            PIVOT_LEFT,
+            total - PIVOT_RIGHT,
+        ):
+
+            candle = candles[i]
+
+            is_high = True
+
+            # ------------------------------------------------
+            # Compare against candles to the left.
+            # ------------------------------------------------
+
+            for j in range(
+                i - PIVOT_LEFT,
+                i,
+            ):
+
+                if candles[j].high > candle.high:
+                    is_high = False
+                    break
+
+            if not is_high:
+                continue
+
+            # ------------------------------------------------
+            # Compare against candles to the right.
+            # ------------------------------------------------
+
+            for j in range(
+                i + 1,
+                i + PIVOT_RIGHT + 1,
+            ):
+
+                if candles[j].high > candle.high:
+                    is_high = False
+                    break
+
+            if not is_high:
+                continue
+
+            pivots.append(
+                Pivot(
+                    index=i,
+                    candle_id=int(candle.candle_id),
+                    timestamp=candle.timestamp,
+                    price=float(candle.high),
+                    kind="HIGH",
+                )
+            )
+
+        return pivots
+
+    # ========================================================
+    # LOW PIVOTS
+    # ========================================================
+
+    @staticmethod
+    def _find_low_pivots(
+        candles,
+    ) -> List[Pivot]:
+
+        pivots: List[Pivot] = []
+
+        total = len(candles)
+
+        for i in range(
+            PIVOT_LEFT,
+            total - PIVOT_RIGHT,
+        ):
+
+            candle = candles[i]
+
+            is_low = True
+
+            # ------------------------------------------------
+            # Compare against candles to the left.
+            # ------------------------------------------------
+
+            for j in range(
+                i - PIVOT_LEFT,
+                i,
+            ):
+
+                if candles[j].low < candle.low:
+                    is_low = False
+                    break
+
+            if not is_low:
+                continue
+
+            # ------------------------------------------------
+            # Compare against candles to the right.
+            # ------------------------------------------------
+
+            for j in range(
+                i + 1,
+                i + PIVOT_RIGHT + 1,
+            ):
+
+                if candles[j].low < candle.low:
+                    is_low = False
+                    break
+
+            if not is_low:
+                continue
+
+            pivots.append(
+                Pivot(
+                    index=i,
+                    candle_id=int(candle.candle_id),
+                    timestamp=candle.timestamp,
+                    price=float(candle.low),
+                    kind="LOW",
+                )
+            )
+
+        return pivots
+
+    # ========================================================
+    # PERCENTAGE HELPERS
+    # ========================================================
+
+    @staticmethod
+    def _down_pct(
+        start: float,
+        end: float,
+    ) -> float:
+
+        if start <= 0:
+            return 0.0
+
+        return ((start - end) / start) * 100.0
+
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _up_pct(
+        start: float,
+        end: float,
+    ) -> float:
+
+        if start <= 0:
+            return 0.0
+
+        return ((end - start) / start) * 100.0
+
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _difference_pct(
+        first: float,
+        second: float,
+    ) -> float:
+
+        if first <= 0:
+            return 0.0
+
+        return (abs(first - second) / first) * 100.0
+
+    # ========================================================
+    # DUPLICATE PROTECTION
+    # ========================================================
+
+    def _already_alerted(
+        self,
+        symbol: str,
+        pattern: str,
+        outer1: int,
+        outer2: int,
+    ) -> bool:
+
+        key = (
+            pattern,
+            outer1,
+            outer2,
+        )
+
+        history = self._alert_history.setdefault(
+            symbol,
+            [],
+        )
+
+        if key in history:
+            return True
+
+        history.append(key)
+
+        # Keep memory bounded.
+        if len(history) > MAX_ALERT_HISTORY:
+            del history[:-MAX_ALERT_HISTORY]
+
+        return False
+
+    # ========================================================
     # BUILD ALERT
-    # ==========================================================
+    # ========================================================
 
     def _build_alert(
         self,
-        signal,
-        candle: Candle,
+        pattern: str,
+        direction: str,
         symbol: str,
-    ) -> Optional[dict]:
+        reversal_pct: float,
+        outer_difference_pct: float,
+        separation: int,
+        entry: float,
+        **points,
+    ) -> Dict[str, object]:
         """
-        Convert MWPatternSignal into AIMIOS alert payload.
+        Build the exact dictionary consumed by CandleBuffer.
+
+        CandleBuffer expects:
+
+            pattern
+            direction
+            confidence
+            entry
+
+        It subsequently adds:
+
+            day_high
+            day_low
+            price
         """
 
-        pattern = str(
-            getattr(
-                signal,
-                "pattern",
-                "",
-            )
-        ).upper()
+        # ----------------------------------------------------
+        # Confidence
+        #
+        # This is NOT used as a detection requirement.
+        #
+        # Detection is determined strictly by the user's
+        # 0.13%, 0.03%, and 7-candle rules.
+        #
+        # Confidence is only an informational score.
+        # ----------------------------------------------------
 
-        # ------------------------------------------------------
-        # Only M/W patterns are accepted.
-        # ------------------------------------------------------
+        reversal_score = min(
+            reversal_pct / MIN_REVERSAL_PCT,
+            2.0,
+        )
 
-        if pattern not in {
-            "M",
-            "W",
-            "DOUBLE_TOP",
-            "DOUBLE_BOTTOM",
-        }:
+        difference_score = min(
+            outer_difference_pct / MIN_OUTER_DIFFERENCE_PCT,
+            2.0,
+        )
 
-            return None
+        separation_score = min(
+            separation / MIN_OUTER_CANDLE_SEPARATION,
+            2.0,
+        )
 
-        # ======================================================
-        # DIRECTION
-        # ======================================================
+        confidence = (
+            (reversal_score + difference_score + separation_score) / 6.0
+        ) * 100.0
 
-        if pattern in {
-            "M",
-            "DOUBLE_TOP",
-        }:
-
-            direction = "SELL"
-
-        elif pattern in {
-            "W",
-            "DOUBLE_BOTTOM",
-        }:
-
-            direction = "BUY"
-
-        else:
-
-            return None
-
-        # ======================================================
-        # SIGNAL VALUES
-        # ======================================================
-
-        confidence = self._safe_float(
-            getattr(
-                signal,
-                "confidence",
-                0.0,
+        confidence = max(
+            0.0,
+            min(
+                confidence,
+                100.0,
             ),
-            default=0.0,
         )
 
-        entry = getattr(
-            signal,
-            "entry",
-            None,
-        )
+        # ----------------------------------------------------
+        # Standardize timestamps to IST.
+        # ----------------------------------------------------
 
-        if entry is None:
-            entry = candle.close
+        normalized_points = {}
 
-        stoploss = getattr(
-            signal,
-            "stoploss",
-            None,
-        )
+        for name, point in points.items():
 
-        target = getattr(
-            signal,
-            "target",
-            None,
-        )
+            if point is None:
+                continue
 
-        timestamp = getattr(
-            signal,
-            "timestamp",
-            None,
-        )
+            normalized_points[name] = {
+                "candle_id": point.candle_id,
+                "timestamp": self._ist_timestamp(point.timestamp),
+                "price": point.price,
+            }
 
-        if timestamp is None:
-            timestamp = candle.timestamp
-
-        # ======================================================
-        # STRUCTURE
-        # ======================================================
-
-        high1 = getattr(
-            signal,
-            "high1",
-            None,
-        )
-
-        valley = getattr(
-            signal,
-            "valley",
-            None,
-        )
-
-        high2 = getattr(
-            signal,
-            "high2",
-            None,
-        )
-
-        valley1 = getattr(
-            signal,
-            "valley1",
-            None,
-        )
-
-        high = getattr(
-            signal,
-            "high",
-            None,
-        )
-
-        valley2 = getattr(
-            signal,
-            "valley2",
-            None,
-        )
-
-        # ======================================================
-        # METRICS
-        # ======================================================
-
-        reversal_pct = getattr(
-            signal,
-            "reversal_pct",
-            None,
-        )
-
-        swing_distance_pct = getattr(
-            signal,
-            "swing_distance_pct",
-            None,
-        )
-
-        candle_distance = getattr(
-            signal,
-            "candle_distance",
-            None,
-        )
-
-        pivot_distance = getattr(
-            signal,
-            "pivot_distance",
-            None,
-        )
-
-        first_pivot_candle_id = getattr(
-            signal,
-            "first_pivot_candle_id",
-            None,
-        )
-
-        second_pivot_candle_id = getattr(
-            signal,
-            "second_pivot_candle_id",
-            None,
-        )
-
-        # ======================================================
-        # RETURN PAYLOAD
-        # ======================================================
-
-        return {
-            "engine": self.name,
-            "symbol": symbol,
+        alert = {
             "pattern": pattern,
             "direction": direction,
-            "confidence": confidence,
-            "entry": entry,
-            "stoploss": stoploss,
-            "target": target,
-            "timestamp": timestamp,
-            "candle_id": getattr(
-                candle,
-                "candle_id",
-                None,
+            "symbol": symbol,
+            "confidence": round(
+                confidence,
+                1,
             ),
-            # --------------------------------------------------
-            # M STRUCTURE
-            # --------------------------------------------------
-            "high1": high1,
-            "valley": valley,
-            "high2": high2,
-            # --------------------------------------------------
-            # W STRUCTURE
-            # --------------------------------------------------
-            "valley1": valley1,
-            "high": high,
-            "valley2": valley2,
-            # --------------------------------------------------
-            # STRUCTURE METRICS
-            # --------------------------------------------------
-            "reversal_pct": reversal_pct,
-            "swing_distance_pct": swing_distance_pct,
-            "candle_distance": candle_distance,
-            "pivot_distance": pivot_distance,
-            "first_pivot_candle_id": first_pivot_candle_id,
-            "second_pivot_candle_id": second_pivot_candle_id,
+            "entry": entry,
+            # Detection measurements.
+            "reversal_pct": round(
+                reversal_pct,
+                4,
+            ),
+            "outer_difference_pct": round(
+                outer_difference_pct,
+                4,
+            ),
+            "candle_separation": separation,
+            # Pattern points.
+            **normalized_points,
         }
 
-    # ==========================================================
-    # ALERT KEY
-    # ==========================================================
-
-    def _make_alert_key(
-        self,
-        payload: dict,
-    ) -> str:
-        """
-        Build a structural alert key.
-
-        IMPORTANT:
-
-        candle_id alone is NOT sufficient.
-
-        A pattern can remain the same while several candles
-        arrive after the pattern has formed.
-
-        Therefore the two outer pivot candle IDs are used.
-
-        M:
-            HIGH1 candle + HIGH2 candle
-
-        W:
-            VALLEY1 candle + VALLEY2 candle
-        """
-
-        symbol = str(
-            payload.get(
-                "symbol",
-                "",
-            )
+        logger.warning(
+            "MW DETECTED | "
+            "%s | pattern=%s | direction=%s | "
+            "confidence=%.1f | "
+            "reversal=%.4f%% | "
+            "outer_difference=%.4f%% | "
+            "separation=%d | entry=%s",
+            symbol,
+            pattern,
+            direction,
+            confidence,
+            reversal_pct,
+            outer_difference_pct,
+            separation,
+            entry,
         )
 
-        pattern = str(
-            payload.get(
-                "pattern",
-                "",
-            )
-        )
+        return alert
 
-        direction = str(
-            payload.get(
-                "direction",
-                "",
-            )
-        )
-
-        first_pivot = payload.get("first_pivot_candle_id")
-
-        second_pivot = payload.get("second_pivot_candle_id")
-
-        # ------------------------------------------------------
-        # Fallback for any legacy signal that does not expose
-        # pivot candle IDs.
-        # ------------------------------------------------------
-
-        if first_pivot is None:
-
-            first_pivot = payload.get(
-                "candle_id",
-                "",
-            )
-
-        if second_pivot is None:
-
-            second_pivot = payload.get(
-                "candle_id",
-                "",
-            )
-
-        return "|".join(
-            [
-                symbol,
-                pattern,
-                direction,
-                str(first_pivot),
-                str(second_pivot),
-            ]
-        )
-
-    # ==========================================================
-    # SAFE FLOAT
-    # ==========================================================
+    # ========================================================
+    # IST TIMESTAMP
+    # ========================================================
 
     @staticmethod
-    def _safe_float(
-        value,
-        default: float = 0.0,
-    ) -> float:
+    def _ist_timestamp(
+        timestamp: Optional[datetime],
+    ) -> Optional[str]:
+
+        if timestamp is None:
+            return None
 
         try:
 
-            return float(value)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=INDIA_TZ)
 
-        except (
-            TypeError,
-            ValueError,
-        ):
+            else:
+                timestamp = timestamp.astimezone(INDIA_TZ)
 
-            return default
-
-    # ==========================================================
-    # RESET
-    # ==========================================================
-
-    def clear(self) -> None:
-        """
-        Reset Sentinel and underlying M/W engine.
-        """
-
-        try:
-
-            self.engine.reset()
+            return timestamp.isoformat()
 
         except Exception:
 
-            logger.exception("Failed to reset MWPatternEngine")
-
-            try:
-                self.engine.clear()
-            except Exception:
-                pass
-
-        self._last_alert_key = None
-
-        logger.info("Pattern Sentinel reset")
+            return str(timestamp)

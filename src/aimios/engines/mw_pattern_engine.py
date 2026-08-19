@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, List, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -14,15 +16,19 @@ logger = logging.getLogger(__name__)
 # Required first-leg reversal.
 MIN_REVERSAL_PCT = 0.13
 
-# Maximum difference between outer pivots.
+# M:
+# HIGH1 must be higher than HIGH2 by at least 0.03%.
+MIN_HIGH1_HIGH2_DIFFERENCE_PCT = 0.03
+
+# W:
+# VALLEY1 and VALLEY2 must be within 0.03%.
 MAX_OUTER_DIFFERENCE_PCT = 0.03
 
-# Minimum candle distance between outer pivots.
+# Minimum distance between the two outer points.
 MIN_PIVOT_DISTANCE = 7
 
-# Confidence defaults.
-M_PATTERN_CONFIDENCE = 90.0
-W_PATTERN_CONFIDENCE = 90.0
+# Indian market timezone.
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
 
 # ============================================================
@@ -32,23 +38,29 @@ W_PATTERN_CONFIDENCE = 90.0
 
 @dataclass(frozen=True)
 class MWPatternSignal:
+
     pattern: str
     direction: str
     confidence: float
+
     entry: float
     stoploss: float
     target: float
+
     timestamp: Any
     symbol: str
 
+    # M
     high1: Optional[float] = None
     valley: Optional[float] = None
     high2: Optional[float] = None
 
+    # W
     valley1: Optional[float] = None
     high: Optional[float] = None
     valley2: Optional[float] = None
 
+    # Metrics
     reversal_pct: Optional[float] = None
     swing_distance_pct: Optional[float] = None
     candle_distance: Optional[int] = None
@@ -57,8 +69,15 @@ class MWPatternSignal:
     first_pivot_candle_id: Optional[int] = None
     second_pivot_candle_id: Optional[int] = None
 
+    # Day information
+    day_high: Optional[float] = None
+    day_low: Optional[float] = None
+
+    day_high_candle_id: Optional[int] = None
+    day_low_candle_id: Optional[int] = None
+
     # --------------------------------------------------------
-    # Dictionary compatibility for existing AIMIOS tests.
+    # Existing AIMIOS compatibility
     # --------------------------------------------------------
 
     def __getitem__(self, key: str) -> Any:
@@ -72,75 +91,92 @@ class MWPatternSignal:
 
 class MWPatternEngine:
     """
-    AIMIOS M/W pattern detector.
+    AIMIOS M/W pattern detector using CURRENT TRADING DAY
+    HIGH / LOW.
 
+    ============================================================
     M PATTERN
-    ---------
+    ============================================================
 
-        HIGH1
-           |
-           | >= 0.13%
-           |
-        VALLEY
-           |
-           | recovery
-           |
-        HIGH2
+                   DAY HIGH / HIGH1
+                         |
+                         |
+                         | >= 0.13%
+                         |
+                      VALLEY
+                         |
+                         |
+                      HIGH2
+                         |
+                         |
 
-    Required:
+    Requirements:
 
-        HIGH1 -> VALLEY >= 0.13%
+        1. HIGH1 is the current day's HIGH.
 
-        abs(HIGH1 - HIGH2) / HIGH1 <= 0.03%
+        2. HIGH1 must occur before HIGH2.
 
-        HIGH1 and HIGH2 >= 7 candles apart
+        3. HIGH1 -> VALLEY >= 0.13%.
 
-    IMPORTANT:
-        There is NO 0.13% requirement on the recovery from
-        VALLEY to HIGH2.
+        4. HIGH1 > HIGH2.
 
-    This is important because the AIMIOS valid-M test contains:
+        5. HIGH1 -> HIGH2 difference >= 0.03%.
 
-        HIGH1  = 24500
-        VALLEY = 24465
-        HIGH2  = 24494
+        6. HIGH1 -> HIGH2 >= 7 candles.
 
-    HIGH1 -> VALLEY is about 0.14286%, which is valid.
+        7. HIGH2 must already be completed.
 
-    HIGH2 -> VALLEY is only about 0.1185%, but this is allowed.
-
-
+    ============================================================
     W PATTERN
-    ---------
+    ============================================================
 
-        VALLEY1
-           |
-           | >= 0.13%
-           |
-          HIGH
-           |
-           | pullback
-           |
-        VALLEY2
+                 VALLEY1 / DAY LOW
+                         |
+                         |
+                         | >= 0.13%
+                         |
+                        HIGH
+                         |
+                         |
+                      VALLEY2
+                         |
+                         |
 
-    Required:
+    Requirements:
 
-        VALLEY1 -> HIGH >= 0.13%
+        1. VALLEY1 is the current day's LOW.
 
-        abs(VALLEY1 - VALLEY2) / VALLEY1 <= 0.03%
+        2. VALLEY1 must occur before VALLEY2.
 
-        VALLEY1 and VALLEY2 >= 7 candles apart
+        3. VALLEY1 -> HIGH >= 0.13%.
 
-    There is NO additional 0.13% requirement on the second leg.
+        4. VALLEY1 and VALLEY2 within 0.03%.
 
+        5. VALLEY1 -> VALLEY2 >= 7 candles.
 
-    Pivot detection
-    ---------------
+        6. VALLEY2 must already be completed.
 
-    Small plateaus / near-pivots are allowed.
+    ============================================================
 
-    This is intentional for market data where a turning point
-    can span multiple nearby candles.
+    IMPORTANT
+    ============================================================
+
+    The engine is causal.
+
+    It does NOT use future candles.
+
+    Example:
+
+        10:00  -> day high = 100
+        10:01  -> falls
+        ...
+        10:10  -> HIGH2 = 99.95
+
+    The 10:10 candle can confirm an M if all rules
+    are satisfied.
+
+    If a new higher day high is made later, that later
+    high becomes the new day high for subsequent analysis.
     """
 
     name = "MWPatternEngine"
@@ -149,12 +185,15 @@ class MWPatternEngine:
         self,
         min_reversal_pct: float = MIN_REVERSAL_PCT,
         max_outer_difference_pct: float = MAX_OUTER_DIFFERENCE_PCT,
+        min_high1_high2_difference_pct: float = MIN_HIGH1_HIGH2_DIFFERENCE_PCT,
         min_pivot_distance: int = MIN_PIVOT_DISTANCE,
     ) -> None:
 
         self.min_reversal_pct = float(min_reversal_pct)
 
         self.max_outer_difference_pct = float(max_outer_difference_pct)
+
+        self.min_high1_high2_difference_pct = float(min_high1_high2_difference_pct)
 
         self.min_pivot_distance = int(min_pivot_distance)
 
@@ -176,13 +215,30 @@ class MWPatternEngine:
         if len(candles) < self.min_pivot_distance + 1:
             return None
 
+        # ----------------------------------------------------
+        # Work only with the CURRENT TRADING DAY.
+        # ----------------------------------------------------
+
+        day_candles = self._get_current_trading_day_candles(candles)
+
+        if len(day_candles) < self.min_pivot_distance + 1:
+            return None
+
+        # ----------------------------------------------------
+        # Detect M.
+        # ----------------------------------------------------
+
         m_signal = self._detect_m(
-            candles,
+            day_candles,
             symbol,
         )
 
+        # ----------------------------------------------------
+        # Detect W.
+        # ----------------------------------------------------
+
         w_signal = self._detect_w(
-            candles,
+            day_candles,
             symbol,
         )
 
@@ -198,8 +254,11 @@ class MWPatternEngine:
         if not candidates:
             return None
 
-        # Prefer the formation whose second outer pivot
-        # occurs latest.
+        # ----------------------------------------------------
+        # Prefer the pattern whose second outer point is
+        # latest.
+        # ----------------------------------------------------
+
         candidates.sort(
             key=lambda signal: (
                 signal.second_pivot_candle_id
@@ -214,17 +273,100 @@ class MWPatternEngine:
         self.last_signal = signal
 
         logger.info(
-            "M/W pattern detected | "
+            "DAY M/W pattern detected | "
             "symbol=%s | pattern=%s | direction=%s | "
-            "confidence=%.1f | entry=%.2f",
+            "confidence=%.1f | entry=%.2f | "
+            "day_high=%s | day_low=%s",
             signal.symbol,
             signal.pattern,
             signal.direction,
             signal.confidence,
             signal.entry,
+            signal.day_high,
+            signal.day_low,
         )
 
         return signal
+
+    # ========================================================
+    # CURRENT TRADING DAY
+    # ========================================================
+
+    def _get_current_trading_day_candles(
+        self,
+        candles: List[Any],
+    ) -> List[Any]:
+        """
+        Return only candles belonging to the latest trading day.
+
+        Candle timestamps are converted to Asia/Kolkata before
+        comparing dates.
+
+        This is important because AIMIOS internally uses UTC.
+        """
+
+        if not candles:
+            return []
+
+        latest = candles[-1]
+
+        latest_date = self._trading_date(
+            getattr(
+                latest,
+                "timestamp",
+                None,
+            )
+        )
+
+        if latest_date is None:
+            return candles
+
+        result: List[Any] = []
+
+        for candle in candles:
+
+            candle_date = self._trading_date(
+                getattr(
+                    candle,
+                    "timestamp",
+                    None,
+                )
+            )
+
+            if candle_date == latest_date:
+                result.append(candle)
+
+        return result
+
+    # ========================================================
+    # TRADING DATE
+    # ========================================================
+
+    @staticmethod
+    def _trading_date(
+        timestamp: Any,
+    ):
+
+        if timestamp is None:
+            return None
+
+        try:
+
+            if not isinstance(
+                timestamp,
+                datetime,
+            ):
+                return None
+
+            if timestamp.tzinfo is None:
+
+                timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+
+            return timestamp.astimezone(INDIA_TZ).date()
+
+        except Exception:
+
+            return None
 
     # ========================================================
     # M DETECTION
@@ -236,114 +378,142 @@ class MWPatternEngine:
         symbol: str,
     ) -> Optional[MWPatternSignal]:
 
-        highs = self._find_high_pivots(candles)
-        lows = self._find_low_pivots(candles)
-
-        if not highs or not lows:
+        if len(candles) < self.min_pivot_distance + 1:
             return None
 
+        # ----------------------------------------------------
+        # CURRENT DAY HIGH
+        # ----------------------------------------------------
+
+        day_high_candle = max(
+            candles,
+            key=lambda item: float(item.high),
+        )
+
+        day_high = float(day_high_candle.high)
+
+        high1_index = self._candle_index(
+            candles,
+            day_high_candle,
+        )
+
+        if high1_index is None:
+            return None
+
+        # ----------------------------------------------------
+        # HIGH1 must not be the final candle.
+        #
+        # We need candles AFTER the day high to form the
+        # valley and HIGH2.
+        # ----------------------------------------------------
+
+        if high1_index >= len(candles) - 1:
+            return None
+
+        # ----------------------------------------------------
+        # HIGH2 candidates occur AFTER DAY HIGH.
+        # ----------------------------------------------------
+
+        high2_candidates = []
+
+        for index in range(
+            high1_index + self.min_pivot_distance,
+            len(candles),
+        ):
+
+            candle = candles[index]
+
+            # Last candle can be used because CandleBuffer
+            # sends only COMPLETED candles to this engine.
+
+            high2_candidates.append((index, candle))
+
+        if not high2_candidates:
+            return None
+
+        # ----------------------------------------------------
         # Search newest HIGH2 first.
-        for high2 in reversed(highs):
+        # ----------------------------------------------------
 
-            high2_index = self._candle_index(
-                candles,
-                high2,
-            )
+        for high2_index, high2 in reversed(high2_candidates):
 
-            if high2_index is None:
+            high2_value = float(high2.high)
+
+            # ------------------------------------------------
+            # HIGH1 must be higher than HIGH2.
+            # ------------------------------------------------
+
+            if day_high <= high2_value:
                 continue
 
-            # Search HIGH1 backwards.
-            for high1 in reversed(highs):
+            swing_distance_pct = (day_high - high2_value) / abs(day_high) * 100.0
 
-                high1_index = self._candle_index(
+            if swing_distance_pct < self.min_high1_high2_difference_pct:
+                continue
+
+            # ------------------------------------------------
+            # Find local valleys between HIGH1 and HIGH2.
+            # ------------------------------------------------
+
+            valleys_between = []
+
+            for index in range(
+                high1_index + 1,
+                high2_index,
+            ):
+
+                candle = candles[index]
+
+                if self._is_low_pivot(
                     candles,
-                    high1,
-                )
+                    index,
+                ):
 
-                if high1_index is None:
-                    continue
+                    valleys_between.append((index, candle))
 
-                if high1_index >= high2_index:
-                    continue
+            if not valleys_between:
+                continue
 
-                candle_distance = high2_index - high1_index
+            # ------------------------------------------------
+            # Deepest valley.
+            # ------------------------------------------------
 
-                # Minimum outer-pivot separation.
-                if candle_distance < self.min_pivot_distance:
-                    continue
+            valley_index, valley = min(
+                valleys_between,
+                key=lambda item: float(item[1].low),
+            )
 
-                # HIGH1 and HIGH2 must be approximately
-                # equal.
-                swing_distance_pct = self._difference_pct(
-                    float(high1.high),
-                    float(high2.high),
-                )
+            valley_value = float(valley.low)
 
-                if swing_distance_pct > self.max_outer_difference_pct:
-                    continue
+            # ------------------------------------------------
+            # HIGH1 -> VALLEY >= 0.13%
+            # ------------------------------------------------
 
-                # Find valleys between HIGH1 and HIGH2.
-                valleys_between: List[Any] = []
+            reversal_pct = (day_high - valley_value) / abs(day_high) * 100.0
 
-                for valley in lows:
+            if reversal_pct < self.min_reversal_pct:
+                continue
 
-                    valley_index = self._candle_index(
-                        candles,
-                        valley,
-                    )
+            candle_distance = high2_index - high1_index
 
-                    if valley_index is None:
-                        continue
+            # ------------------------------------------------
+            # CONFIRMED M
+            # ------------------------------------------------
 
-                    if high1_index < valley_index < high2_index:
-                        valleys_between.append(valley)
-
-                if not valleys_between:
-                    continue
-
-                # Use the deepest valley.
-                valley = min(
-                    valleys_between,
-                    key=lambda item: float(item.low),
-                )
-
-                # ------------------------------------------------
-                # THE ONLY REQUIRED REVERSAL FOR M.
-                #
-                # HIGH1 -> VALLEY >= 0.13%
-                # ------------------------------------------------
-
-                reversal_pct = (
-                    (float(high1.high) - float(valley.low))
-                    / abs(float(high1.high))
-                    * 100.0
-                )
-
-                if reversal_pct < self.min_reversal_pct:
-                    continue
-
-                # ------------------------------------------------
-                # DO NOT require:
-                #
-                # VALLEY -> HIGH2 >= 0.13%
-                #
-                # This was the bug causing the valid-M test
-                # to fail.
-                # ------------------------------------------------
-
-                return self._build_m_signal(
-                    candles=candles,
-                    symbol=symbol,
-                    high1=high1,
-                    valley=valley,
-                    high2=high2,
-                    high1_index=high1_index,
-                    high2_index=high2_index,
-                    reversal_pct=reversal_pct,
-                    swing_distance_pct=swing_distance_pct,
-                    candle_distance=candle_distance,
-                )
+            return self._build_m_signal(
+                candles=candles,
+                symbol=symbol,
+                high1=day_high_candle,
+                valley=valley,
+                high2=high2,
+                high1_index=high1_index,
+                high2_index=high2_index,
+                reversal_pct=reversal_pct,
+                swing_distance_pct=swing_distance_pct,
+                candle_distance=candle_distance,
+                day_high=day_high,
+                day_low=min(float(c.low) for c in candles),
+            )
 
         return None
 
@@ -357,112 +527,136 @@ class MWPatternEngine:
         symbol: str,
     ) -> Optional[MWPatternSignal]:
 
-        lows = self._find_low_pivots(candles)
-        highs = self._find_high_pivots(candles)
-
-        if not lows or not highs:
+        if len(candles) < self.min_pivot_distance + 1:
             return None
 
-        # Search newest VALLEY2 first.
-        for valley2 in reversed(lows):
+        # ----------------------------------------------------
+        # CURRENT DAY LOW
+        # ----------------------------------------------------
 
-            valley2_index = self._candle_index(
-                candles,
-                valley2,
+        day_low_candle = min(
+            candles,
+            key=lambda item: float(item.low),
+        )
+
+        day_low = float(day_low_candle.low)
+
+        valley1_index = self._candle_index(
+            candles,
+            day_low_candle,
+        )
+
+        if valley1_index is None:
+            return None
+
+        # ----------------------------------------------------
+        # DAY LOW must have candles after it.
+        # ----------------------------------------------------
+
+        if valley1_index >= len(candles) - 1:
+            return None
+
+        # ----------------------------------------------------
+        # VALLEY2 must occur later.
+        # ----------------------------------------------------
+
+        valley2_candidates = []
+
+        for index in range(
+            valley1_index + self.min_pivot_distance,
+            len(candles),
+        ):
+
+            candle = candles[index]
+
+            valley2_candidates.append((index, candle))
+
+        if not valley2_candidates:
+            return None
+
+        # ----------------------------------------------------
+        # Search newest VALLEY2 first.
+        # ----------------------------------------------------
+
+        for valley2_index, valley2 in reversed(valley2_candidates):
+
+            valley2_value = float(valley2.low)
+
+            # ------------------------------------------------
+            # VALLEY1 vs VALLEY2 <= 0.03%
+            # ------------------------------------------------
+
+            swing_distance_pct = self._difference_pct(
+                day_low,
+                valley2_value,
             )
 
-            if valley2_index is None:
+            if swing_distance_pct > self.max_outer_difference_pct:
                 continue
 
-            # Search VALLEY1 backwards.
-            for valley1 in reversed(lows):
+            # ------------------------------------------------
+            # Find highest middle high.
+            # ------------------------------------------------
 
-                valley1_index = self._candle_index(
+            highs_between = []
+
+            for index in range(
+                valley1_index + 1,
+                valley2_index,
+            ):
+
+                candle = candles[index]
+
+                if self._is_high_pivot(
                     candles,
-                    valley1,
-                )
+                    index,
+                ):
 
-                if valley1_index is None:
-                    continue
+                    highs_between.append((index, candle))
 
-                if valley1_index >= valley2_index:
-                    continue
+            if not highs_between:
+                continue
 
-                candle_distance = valley2_index - valley1_index
+            # ------------------------------------------------
+            # Highest middle high.
+            # ------------------------------------------------
 
-                if candle_distance < self.min_pivot_distance:
-                    continue
+            high_index, high = max(
+                highs_between,
+                key=lambda item: float(item[1].high),
+            )
 
-                # VALLEY1 and VALLEY2 must be approximately
-                # equal.
-                swing_distance_pct = self._difference_pct(
-                    float(valley1.low),
-                    float(valley2.low),
-                )
+            high_value = float(high.high)
 
-                if swing_distance_pct > self.max_outer_difference_pct:
-                    continue
+            # ------------------------------------------------
+            # VALLEY1 -> HIGH >= 0.13%
+            # ------------------------------------------------
 
-                # Find highs between the two valleys.
-                highs_between: List[Any] = []
+            reversal_pct = (high_value - day_low) / abs(day_low) * 100.0
 
-                for high in highs:
+            if reversal_pct < self.min_reversal_pct:
+                continue
 
-                    high_index = self._candle_index(
-                        candles,
-                        high,
-                    )
+            candle_distance = valley2_index - valley1_index
 
-                    if high_index is None:
-                        continue
+            # ------------------------------------------------
+            # CONFIRMED W
+            # ------------------------------------------------
 
-                    if valley1_index < high_index < valley2_index:
-                        highs_between.append(high)
-
-                if not highs_between:
-                    continue
-
-                # Highest middle peak.
-                high = max(
-                    highs_between,
-                    key=lambda item: float(item.high),
-                )
-
-                # ------------------------------------------------
-                # THE ONLY REQUIRED REVERSAL FOR W.
-                #
-                # VALLEY1 -> HIGH >= 0.13%
-                # ------------------------------------------------
-
-                reversal_pct = (
-                    (float(high.high) - float(valley1.low))
-                    / abs(float(valley1.low))
-                    * 100.0
-                )
-
-                if reversal_pct < self.min_reversal_pct:
-                    continue
-
-                # ------------------------------------------------
-                # DO NOT require:
-                #
-                # HIGH -> VALLEY2 >= 0.13%
-                #
-                # The second leg only needs to form the W.
-                # ------------------------------------------------
-
-                return self._build_w_signal(
-                    candles=candles,
-                    symbol=symbol,
-                    valley1=valley1,
-                    high=high,
-                    valley2=valley2,
-                    valley1_index=valley1_index,
-                    valley2_index=valley2_index,
-                    reversal_pct=reversal_pct,
-                    swing_distance_pct=swing_distance_pct,
-                    candle_distance=candle_distance,
-                )
+            return self._build_w_signal(
+                candles=candles,
+                symbol=symbol,
+                valley1=day_low_candle,
+                high=high,
+                valley2=valley2,
+                valley1_index=valley1_index,
+                valley2_index=valley2_index,
+                reversal_pct=reversal_pct,
+                swing_distance_pct=swing_distance_pct,
+                candle_distance=candle_distance,
+                day_high=max(float(c.high) for c in candles),
+                day_low=day_low,
+            )
 
         return None
 
@@ -482,6 +676,8 @@ class MWPatternEngine:
         reversal_pct: float,
         swing_distance_pct: float,
         candle_distance: int,
+        day_high: float,
+        day_low: float,
     ) -> MWPatternSignal:
 
         last = candles[-1]
@@ -507,6 +703,7 @@ class MWPatternEngine:
         )
 
         if risk <= 0.0:
+
             risk = max(
                 float(high2.high) - float(valley.low),
                 0.0,
@@ -515,9 +712,9 @@ class MWPatternEngine:
         target = entry - (risk * 2.0)
 
         confidence = self._calculate_confidence(
-            reversal_pct=reversal_pct,
-            swing_distance_pct=swing_distance_pct,
-            candle_distance=candle_distance,
+            reversal_pct,
+            swing_distance_pct,
+            candle_distance,
         )
 
         return MWPatternSignal(
@@ -548,6 +745,12 @@ class MWPatternEngine:
                 high2,
                 high2_index,
             ),
+            day_high=float(day_high),
+            day_low=float(day_low),
+            day_high_candle_id=self._candle_id(
+                high1,
+                high1_index,
+            ),
         )
 
     # ========================================================
@@ -566,6 +769,8 @@ class MWPatternEngine:
         reversal_pct: float,
         swing_distance_pct: float,
         candle_distance: int,
+        day_high: float,
+        day_low: float,
     ) -> MWPatternSignal:
 
         last = candles[-1]
@@ -591,6 +796,7 @@ class MWPatternEngine:
         )
 
         if risk <= 0.0:
+
             risk = max(
                 float(high.high) - float(valley2.low),
                 0.0,
@@ -599,9 +805,9 @@ class MWPatternEngine:
         target = entry + (risk * 2.0)
 
         confidence = self._calculate_confidence(
-            reversal_pct=reversal_pct,
-            swing_distance_pct=swing_distance_pct,
-            candle_distance=candle_distance,
+            reversal_pct,
+            swing_distance_pct,
+            candle_distance,
         )
 
         return MWPatternSignal(
@@ -632,109 +838,93 @@ class MWPatternEngine:
                 valley2,
                 valley2_index,
             ),
+            day_high=float(day_high),
+            day_low=float(day_low),
+            day_low_candle_id=self._candle_id(
+                valley1,
+                valley1_index,
+            ),
         )
 
     # ========================================================
-    # HIGH PIVOT DETECTION
+    # HIGH PIVOT
     # ========================================================
 
-    def _find_high_pivots(
+    def _is_high_pivot(
         self,
         candles: List[Any],
-    ) -> List[Any]:
+        index: int,
+    ) -> bool:
 
-        pivots: List[Any] = []
+        if index <= 0:
+            return False
 
-        if len(candles) < 3:
-            return pivots
+        if index >= len(candles) - 1:
+            return False
 
-        tolerance_pct = self.max_outer_difference_pct
+        previous = float(candles[index - 1].high)
 
-        for index in range(
-            1,
-            len(candles) - 1,
+        current = float(candles[index].high)
+
+        following = float(candles[index + 1].high)
+
+        # Normal local high.
+        if (
+            current >= previous
+            and current >= following
+            and (current > previous or current > following)
         ):
+            return True
 
-            previous = candles[index - 1]
-            current = candles[index]
-            following = candles[index + 1]
-
-            current_high = float(current.high)
-
-            previous_high = float(previous.high)
-
-            following_high = float(following.high)
-
-            # Standard local high.
-            if (
-                current_high >= previous_high
-                and current_high >= following_high
-                and (current_high > previous_high or current_high > following_high)
-            ):
-                pivots.append(current)
-                continue
-
-            # Near-pivot / plateau.
-            following_difference = self._difference_pct(
-                current_high,
-                following_high,
+        # Small plateau.
+        return (
+            current >= previous
+            and self._difference_pct(
+                current,
+                following,
             )
-
-            if current_high >= previous_high and following_difference <= tolerance_pct:
-                pivots.append(current)
-
-        return pivots
+            <= self.max_outer_difference_pct
+        )
 
     # ========================================================
-    # LOW PIVOT DETECTION
+    # LOW PIVOT
     # ========================================================
 
-    def _find_low_pivots(
+    def _is_low_pivot(
         self,
         candles: List[Any],
-    ) -> List[Any]:
+        index: int,
+    ) -> bool:
 
-        pivots: List[Any] = []
+        if index <= 0:
+            return False
 
-        if len(candles) < 3:
-            return pivots
+        if index >= len(candles) - 1:
+            return False
 
-        tolerance_pct = self.max_outer_difference_pct
+        previous = float(candles[index - 1].low)
 
-        for index in range(
-            1,
-            len(candles) - 1,
+        current = float(candles[index].low)
+
+        following = float(candles[index + 1].low)
+
+        # Normal local low.
+        if (
+            current <= previous
+            and current <= following
+            and (current < previous or current < following)
         ):
+            return True
 
-            previous = candles[index - 1]
-            current = candles[index]
-            following = candles[index + 1]
-
-            current_low = float(current.low)
-
-            previous_low = float(previous.low)
-
-            following_low = float(following.low)
-
-            # Standard local low.
-            if (
-                current_low <= previous_low
-                and current_low <= following_low
-                and (current_low < previous_low or current_low < following_low)
-            ):
-                pivots.append(current)
-                continue
-
-            # Near-pivot / plateau.
-            following_difference = self._difference_pct(
-                current_low,
-                following_low,
+        # Small plateau.
+        return (
+            current <= previous
+            and self._difference_pct(
+                current,
+                following,
             )
-
-            if current_low <= previous_low and following_difference <= tolerance_pct:
-                pivots.append(current)
-
-        return pivots
+            <= self.max_outer_difference_pct
+        )
 
     # ========================================================
     # CANDLE INDEX
@@ -794,6 +984,7 @@ class MWPatternEngine:
 
         try:
             return int(value)
+
         except (
             TypeError,
             ValueError,
@@ -878,5 +1069,7 @@ class MWPatternEngine:
             "last_pattern": (signal.pattern if signal is not None else None),
             "last_direction": (signal.direction if signal is not None else None),
             "last_confidence": (signal.confidence if signal is not None else None),
+            "last_day_high": (signal.day_high if signal is not None else None),
+            "last_day_low": (signal.day_low if signal is not None else None),
             "last_signal": signal,
         }

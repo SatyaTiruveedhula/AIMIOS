@@ -22,15 +22,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Candle:
-    """
-    Immutable OHLC candle.
-
-    CandleBuffer stores only COMPLETED candles in _history.
-
-    The currently forming candle is kept separately in
-    CandleBuffer._current.
-    """
-
     timestamp: datetime
 
     open: float
@@ -91,44 +82,10 @@ class Candle:
 
 
 class CandleBuffer:
-    """
-    Rolling OHLC candle buffer.
-
-    LIVE FLOW
-    ---------
-
-        Kite tick
-            |
-            v
-        MarketSnapshot
-            |
-            v
-        CandleBuffer.update()
-            |
-            +---- current candle
-            |
-            +---- timeframe changes
-                       |
-                       v
-                 completed candle
-                       |
-             +---------+---------+
-             |                   |
-             v                   v
-        subscribers       PatternSentinel
-                               |
-                               v
-                         M/W detection
-
-    PatternSentinel receives COMPLETED candles only.
-
-    The currently forming candle is NEVER passed to
-    PatternSentinel.
-    """
 
     def __init__(
         self,
-        max_candles: int = 300,
+        max_candles: int = 500,
         timeframe: int = 60,
         pattern_detector=None,
     ) -> None:
@@ -144,29 +101,29 @@ class CandleBuffer:
 
         self._lock = RLock()
 
-        # ====================================================
+        # ----------------------------------------------------
         # COMPLETED CANDLES
-        # ====================================================
+        # ----------------------------------------------------
 
         self._history: Dict[str, Deque[Candle]] = defaultdict(
             lambda: deque(maxlen=self.max_candles)
         )
 
-        # ====================================================
-        # CURRENT UNFINISHED CANDLE
-        # ====================================================
+        # ----------------------------------------------------
+        # CURRENT / UNFINISHED CANDLE
+        # ----------------------------------------------------
 
         self._current: Dict[str, Candle] = {}
 
-        # ====================================================
-        # LAST CUMULATIVE VOLUME
-        # ====================================================
+        # ----------------------------------------------------
+        # VOLUME
+        # ----------------------------------------------------
 
         self._last_volume: Dict[str, float] = {}
 
-        # ====================================================
+        # ----------------------------------------------------
         # HIGH / LOW CACHE
-        # ====================================================
+        # ----------------------------------------------------
 
         self._high_cache: Dict[str, Deque[float]] = defaultdict(
             lambda: deque(maxlen=self.max_candles)
@@ -176,57 +133,80 @@ class CandleBuffer:
             lambda: deque(maxlen=self.max_candles)
         )
 
-        # ====================================================
+        # ----------------------------------------------------
+        # BROKER DAY OHLC
+        # ----------------------------------------------------
+
+        self._day_key: Dict[str, str] = {}
+        self._day_high: Dict[str, float] = {}
+        self._day_low: Dict[str, float] = {}
+        self._broker_day_synced: Dict[str, bool] = {}
+
+        # ----------------------------------------------------
         # CANDLE IDS
-        # ====================================================
+        # ----------------------------------------------------
 
         self._next_candle_id: Dict[str, int] = defaultdict(int)
 
-        # ====================================================
-        # SESSION IDS
-        # ====================================================
+        # ----------------------------------------------------
+        # SESSION
+        # ----------------------------------------------------
 
         self._session_id: Dict[str, int] = defaultdict(lambda: 1)
 
-        # ====================================================
-        # NORMAL CANDLE SUBSCRIBERS
-        # ====================================================
+        # ----------------------------------------------------
+        # CANDLE SUBSCRIBERS
+        # ----------------------------------------------------
 
         self._subscribers: List[Callable[[str, Candle], None]] = []
 
-        # ====================================================
-        # M/W PATTERN SENTINEL
-        # ====================================================
-
-        self._pattern_sentinel = None
-
-        try:
-            from aimios.engines.pattern_sentinel import PatternSentinel
-
-            self._pattern_sentinel = PatternSentinel()
-            self._pattern_sentinel.start()
-
-            logger.info("M/W PatternSentinel initialized")
-
-        except Exception:
-            logger.exception("Failed to initialize PatternSentinel")
-
-            self._pattern_sentinel = None
-
-        # ====================================================
-        # EXISTING PATTERN DETECTOR
-        # ====================================================
-
-        self._pattern_detector = pattern_detector
-
-        # ====================================================
+        # ----------------------------------------------------
         # PATTERN SUBSCRIBERS
-        # ====================================================
+        # ----------------------------------------------------
 
         self._pattern_subscribers: List[Callable[[str, Dict[str, object]], None]] = []
 
+        # ----------------------------------------------------
+        # DAY EXTREME PATTERN SENTINEL
+        #
+        # This is the NEW M/W detector.
+        #
+        # It is deliberately separate from the old
+        # PatternSentinel.
+        #
+        # DAY HIGH / DAY LOW / M / W are generated from
+        # completed candles only.
+        # ----------------------------------------------------
+
+        self._day_extreme_sentinel = None
+
+        try:
+            from aimios.engines.day_extreme_pattern_sentinel import (
+                DayExtremePatternSentinel,
+            )
+
+            self._day_extreme_sentinel = DayExtremePatternSentinel()
+
+            logger.info("DayExtremePatternSentinel initialized")
+
+        except Exception:
+            logger.exception("Failed to initialize " "DayExtremePatternSentinel")
+
+            self._day_extreme_sentinel = None
+
+        # ----------------------------------------------------
+        # LEGACY PATTERN DETECTOR
+        #
+        # Kept for compatibility with existing AIMIOS code.
+        #
+        # IMPORTANT:
+        # The new DayExtremePatternSentinel is independent.
+        # ----------------------------------------------------
+
+        self._pattern_detector = pattern_detector
+
         logger.info(
-            "Initialized CandleBuffer(" "max_candles=%d, timeframe=%ds" ")",
+            "Initialized CandleBuffer(" "max_candles=%d, timeframe=%ds)",
             self.max_candles,
             self.timeframe,
         )
@@ -241,13 +221,11 @@ class CandleBuffer:
     ) -> None:
 
         with self._lock:
+
             if callback not in self._subscribers:
                 self._subscribers.append(callback)
 
-        logger.debug(
-            "Subscriber added to CandleBuffer: %s",
-            callback,
-        )
+    # --------------------------------------------------------
 
     def unsubscribe(
         self,
@@ -255,13 +233,11 @@ class CandleBuffer:
     ) -> None:
 
         with self._lock:
+
             if callback in self._subscribers:
                 self._subscribers.remove(callback)
 
-        logger.debug(
-            "Subscriber removed from CandleBuffer: %s",
-            callback,
-        )
+    # --------------------------------------------------------
 
     def subscribe_pattern(
         self,
@@ -272,13 +248,11 @@ class CandleBuffer:
     ) -> None:
 
         with self._lock:
+
             if callback not in self._pattern_subscribers:
                 self._pattern_subscribers.append(callback)
 
-        logger.debug(
-            "Pattern subscriber added: %s",
-            callback,
-        )
+    # --------------------------------------------------------
 
     def unsubscribe_pattern(
         self,
@@ -289,13 +263,11 @@ class CandleBuffer:
     ) -> None:
 
         with self._lock:
+
             if callback in self._pattern_subscribers:
                 self._pattern_subscribers.remove(callback)
 
-        logger.debug(
-            "Pattern subscriber removed: %s",
-            callback,
-        )
+    # --------------------------------------------------------
 
     def set_pattern_detector(
         self,
@@ -304,13 +276,105 @@ class CandleBuffer:
 
         self._pattern_detector = pattern_detector
 
-        logger.debug(
-            "Pattern detector set: %s",
-            pattern_detector,
+    # ========================================================
+    # BROKER DAY OHLC SYNCHRONIZATION
+    # ========================================================
+
+    def sync_broker_day_ohlc(
+        self,
+        instrument_id: str,
+        timestamp: datetime,
+        open_price: float,
+        high_price: float,
+        low_price: float,
+        previous_close: float = 0.0,
+    ) -> None:
+
+        try:
+            high_price = float(high_price)
+            low_price = float(low_price)
+
+        except TypeError, ValueError:
+            return
+
+        if high_price <= 0 or low_price <= 0:
+            return
+
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+
+        day_key = self._india_day_key(timestamp)
+
+        with self._lock:
+
+            previous_day = self._day_key.get(instrument_id)
+
+            # ------------------------------------------------
+            # NEW DAY
+            # ------------------------------------------------
+
+            if previous_day is not None and previous_day != day_key:
+
+                self._day_high.pop(
+                    instrument_id,
+                    None,
+                )
+
+                self._day_low.pop(
+                    instrument_id,
+                    None,
+                )
+
+                self._broker_day_synced[instrument_id] = False
+
+                # Reset Day Extreme Sentinel for new day.
+                if self._day_extreme_sentinel is not None:
+                    try:
+                        self._day_extreme_sentinel.clear_symbol(instrument_id)
+                    except Exception:
+                        logger.exception(
+                            "Failed to reset DayExtremePatternSentinel "
+                            "for new day | %s",
+                            instrument_id,
+                        )
+
+            self._day_key[instrument_id] = day_key
+
+            # ------------------------------------------------
+            # BROKER VALUES ARE AUTHORITATIVE
+            # ------------------------------------------------
+
+            self._day_high[instrument_id] = high_price
+            self._day_low[instrument_id] = low_price
+
+            self._broker_day_synced[instrument_id] = True
+
+        logger.info(
+            "Broker Day OHLC synchronized | " "%s | date=%s | high=%s | low=%s",
+            instrument_id,
+            day_key,
+            high_price,
+            low_price,
         )
 
     # ========================================================
-    # PUBLISH CANDLE
+    # BROKER SYNC STATUS
+    # ========================================================
+
+    def is_broker_day_synced(
+        self,
+        instrument_id: str,
+    ) -> bool:
+
+        with self._lock:
+
+            return self._broker_day_synced.get(
+                instrument_id,
+                False,
+            )
+
+    # ========================================================
+    # PUBLISH COMPLETED CANDLE
     # ========================================================
 
     def _publish(
@@ -322,6 +386,7 @@ class CandleBuffer:
         subscribers = list(self._subscribers)
 
         for subscriber in subscribers:
+
             try:
                 subscriber(
                     instrument_id,
@@ -347,6 +412,7 @@ class CandleBuffer:
         subscribers = list(self._pattern_subscribers)
 
         for subscriber in subscribers:
+
             try:
                 subscriber(
                     instrument_id,
@@ -364,15 +430,6 @@ class CandleBuffer:
         self,
         snapshot: MarketSnapshot,
     ) -> None:
-        """
-        Process one market tick.
-
-        The tick updates the current candle.
-
-        When the timestamp enters a new timeframe bucket,
-        the previous candle is completed and passed through
-        the completed-candle processing pipeline.
-        """
 
         if snapshot is None:
             return
@@ -382,9 +439,26 @@ class CandleBuffer:
         if not instrument_id:
             return
 
+        try:
+            ltp = float(snapshot.ltp)
+        except TypeError, ValueError:
+            return
+
+        if ltp <= 0:
+            return
+
         bucket_time = self._align_timestamp(snapshot.timestamp)
 
         with self._lock:
+
+            # ------------------------------------------------
+            # ENSURE DAY RANGE IS INITIALIZED
+            # ------------------------------------------------
+
+            self._ensure_day(
+                instrument_id,
+                bucket_time,
+            )
 
             volume_delta = self._calculate_volume_delta(
                 instrument_id,
@@ -393,9 +467,11 @@ class CandleBuffer:
 
             current = self._current.get(instrument_id)
 
-            # =================================================
-            # NEW TIMEFRAME
-            # =================================================
+            # ------------------------------------------------
+            # TIMEFRAME CHANGED
+            #
+            # Current candle becomes completed.
+            # ------------------------------------------------
 
             if current is not None and bucket_time != current.timestamp:
 
@@ -411,57 +487,61 @@ class CandleBuffer:
                     completed,
                 )
 
-                logger.debug(
-                    "Completed candle "
-                    "instrument=%s "
-                    "timestamp=%s "
-                    "candle_id=%s "
-                    "session_id=%s",
-                    instrument_id,
-                    completed.timestamp,
-                    completed.candle_id,
-                    completed.session_id,
-                )
-
                 current = None
 
-            # =================================================
-            # CREATE NEW CANDLE
-            # =================================================
+            # ------------------------------------------------
+            # CREATE NEW CURRENT CANDLE
+            # ------------------------------------------------
 
             if current is None:
 
                 new_candle = self._create_candle(
                     instrument_id=instrument_id,
                     timestamp=bucket_time,
-                    ltp=float(snapshot.ltp),
+                    ltp=ltp,
                     volume_delta=volume_delta,
                 )
 
                 self._current[instrument_id] = new_candle
 
-                logger.debug(
-                    "Started candle "
-                    "instrument=%s "
-                    "timestamp=%s "
-                    "candle_id=%s "
-                    "session_id=%s",
+                # ------------------------------------------------
+                # LIVE PRICE CAN EXTEND DAY RANGE
+                # ------------------------------------------------
+
+                self._update_day_extremes(
                     instrument_id,
                     bucket_time,
-                    new_candle.candle_id,
-                    new_candle.session_id,
+                    ltp,
                 )
 
                 return
 
-            # =================================================
+            # ------------------------------------------------
             # UPDATE CURRENT CANDLE
-            # =================================================
+            # ------------------------------------------------
 
-            self._current[instrument_id] = self._update_candle(
+            updated = self._update_candle(
                 current=current,
-                ltp=float(snapshot.ltp),
+                ltp=ltp,
                 volume_delta=volume_delta,
+            )
+
+            self._current[instrument_id] = updated
+
+            # ------------------------------------------------
+            # LIVE CANDLE CAN EXTEND DAY RANGE
+            # ------------------------------------------------
+
+            self._update_day_extremes(
+                instrument_id,
+                bucket_time,
+                updated.high,
+            )
+
+            self._update_day_extremes(
+                instrument_id,
+                bucket_time,
+                updated.low,
             )
 
     # ========================================================
@@ -473,219 +553,412 @@ class CandleBuffer:
         instrument_id: str,
         candle: Candle,
     ) -> None:
-        """
-        Store and process ONE completed candle.
 
-        PatternSentinel receives the completed history only.
-        """
+        # ----------------------------------------------------
+        # STORE COMPLETED CANDLE
+        # ----------------------------------------------------
 
         self._history[instrument_id].append(candle)
+
+        # ----------------------------------------------------
+        # UPDATE HIGH/LOW CACHES
+        # ----------------------------------------------------
 
         self._high_cache[instrument_id].append(candle.high)
 
         self._low_cache[instrument_id].append(candle.low)
 
-        # ====================================================
-        # NORMAL CANDLE SUBSCRIBERS
-        # ====================================================
+        # ----------------------------------------------------
+        # UPDATE DAY RANGE
+        # ----------------------------------------------------
+
+        self._update_day_extremes(
+            instrument_id,
+            candle.timestamp,
+            candle.high,
+        )
+
+        self._update_day_extremes(
+            instrument_id,
+            candle.timestamp,
+            candle.low,
+        )
+
+        # ----------------------------------------------------
+        # PUBLISH COMPLETED CANDLE
+        # ----------------------------------------------------
 
         self._publish(
             instrument_id,
             candle,
         )
 
-        # ====================================================
-        # M/W PATTERN SENTINEL
-        # ====================================================
+        # ----------------------------------------------------
+        # NEW DAY EXTREME M/W SENTINEL
+        #
+        # IMPORTANT:
+        # Only completed candles are passed.
+        # ----------------------------------------------------
 
-        if self._pattern_sentinel is not None:
-
-            try:
-
-                completed_candles = list(self._history[instrument_id])
-
-                if len(completed_candles) >= 7:
-
-                    sentinel_result = self._pattern_sentinel.process_candle(
-                        candle=candle,
-                        candles=completed_candles,
-                        symbol=instrument_id,
-                    )
-
-                    if sentinel_result:
-
-                        logger.warning(
-                            "M/W SENTINEL ALERT | "
-                            "symbol=%s | pattern=%s | "
-                            "direction=%s | confidence=%s",
-                            instrument_id,
-                            sentinel_result.get("pattern"),
-                            sentinel_result.get("direction"),
-                            sentinel_result.get("confidence"),
-                        )
-
-                        self._publish_pattern(
-                            instrument_id,
-                            sentinel_result,
-                        )
-
-            except Exception:
-
-                logger.exception(
-                    "M/W Pattern Sentinel failed for %s",
-                    instrument_id,
-                )
-
-        # ====================================================
-        # EXISTING PATTERN DETECTION
-        # ====================================================
-
-        self._run_pattern_detection(instrument_id)
+        self._run_day_extreme_sentinel(
+            instrument_id,
+            candle,
+        )
 
     # ========================================================
-    # EXISTING PATTERN DETECTION
+    # DAY EXTREME PATTERN SENTINEL
     # ========================================================
 
-    def _run_pattern_detection(
+    def _run_day_extreme_sentinel(
         self,
         instrument_id: str,
+        candle: Candle,
     ) -> None:
-        """
-        Run the existing pattern engines.
 
-        Only completed candles are supplied.
-        """
+        sentinel = self._day_extreme_sentinel
 
-        recent_candles = list(self._history[instrument_id])[-100:]
-
-        if not recent_candles:
+        if sentinel is None:
             return
-
-        # ====================================================
-        # EXISTING PatternDetector
-        # ====================================================
-
-        if self._pattern_detector is not None:
-
-            try:
-
-                patterns = self._pattern_detector.detect(recent_candles)
-
-                logger.debug(
-                    "PatternDetector result " "for %s: %s",
-                    instrument_id,
-                    patterns,
-                )
-
-                if patterns:
-
-                    self._publish_pattern(
-                        instrument_id,
-                        patterns,
-                    )
-
-                    return
-
-            except Exception as exc:
-
-                logger.exception(
-                    "PatternDetector failed " "for %s: %s",
-                    instrument_id,
-                    exc,
-                )
-
-        # ====================================================
-        # PATTERN RECOGNITION ENGINE
-        # ====================================================
 
         try:
 
-            from ..engines.pattern_recognition import (
-                PatternRecognitionEngine,
+            completed_candles = list(self._history[instrument_id])
+
+            # ------------------------------------------------
+            # Need enough completed candles for:
+            #
+            # HIGH1/LOW1
+            # valley/peak
+            # HIGH2/LOW2
+            #
+            # Minimum outer separation = 7 candles.
+            # ------------------------------------------------
+
+            if len(completed_candles) < 8:
+                return
+
+            day_high = self._day_high.get(instrument_id)
+
+            day_low = self._day_low.get(instrument_id)
+
+            if day_high is None or day_low is None:
+                return
+
+            # ------------------------------------------------
+            # PROCESS COMPLETED CANDLE
+            # ------------------------------------------------
+
+            results = sentinel.process_candle(
+                symbol=instrument_id,
+                candle=candle,
+                candles=completed_candles,
+                day_high=day_high,
+                day_low=day_low,
             )
+
+            if not results:
+                return
+
+            # ------------------------------------------------
+            # Sentinel returns a LIST of alerts.
+            # ------------------------------------------------
+
+            if isinstance(results, dict):
+                results = [results]
+
+            for result in results:
+
+                if not isinstance(result, dict):
+                    continue
+
+                alert = dict(result)
+
+                # ------------------------------------------------
+                # ATTACH REAL DAY EXTREMES
+                # ------------------------------------------------
+
+                alert["day_high"] = self._day_high.get(instrument_id)
+
+                alert["day_low"] = self._day_low.get(instrument_id)
+
+                # ------------------------------------------------
+                # NORMALIZE TIMESTAMP
+                # ------------------------------------------------
+
+                alert.setdefault(
+                    "timestamp",
+                    candle.timestamp,
+                )
+
+                # ------------------------------------------------
+                # NORMALIZE PRICE
+                #
+                # DayExtremePatternSentinel already provides
+                # "price".
+                #
+                # Do NOT replace it with "entry".
+                # ------------------------------------------------
+
+                if alert.get("price") is None:
+                    alert["price"] = candle.close
+
+                # ------------------------------------------------
+                # NORMALIZE CONFIDENCE
+                # ------------------------------------------------
+
+                try:
+                    confidence = float(
+                        alert.get(
+                            "confidence",
+                            0.0,
+                        )
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    confidence = 0.0
+
+                alert["confidence"] = round(
+                    confidence,
+                    1,
+                )
+
+                pattern = alert.get(
+                    "pattern",
+                    "UNKNOWN",
+                )
+
+                direction = alert.get(
+                    "direction",
+                    "INFO",
+                )
+
+                # ------------------------------------------------
+                # LOG
+                # ------------------------------------------------
+
+                logger.warning(
+                    "PATTERN ALERT | "
+                    "%s | pattern=%s | direction=%s | "
+                    "confidence=%.1f | price=%s | "
+                    "day_high=%s | day_low=%s",
+                    instrument_id,
+                    pattern,
+                    direction,
+                    alert["confidence"],
+                    alert.get("price"),
+                    alert.get("day_high"),
+                    alert.get("day_low"),
+                )
+
+                # ------------------------------------------------
+                # PUBLISH
+                # ------------------------------------------------
+
+                self._publish_pattern(
+                    instrument_id,
+                    alert,
+                )
 
         except Exception:
 
-            PatternRecognitionEngine = None
+            logger.exception(
+                "DayExtremePatternSentinel failed for %s",
+                instrument_id,
+            )
 
-        if PatternRecognitionEngine is None:
-            return
+    # ========================================================
+    # INDIA DAY KEY
+    # ========================================================
+
+    @staticmethod
+    def _india_day_key(
+        timestamp: datetime,
+    ) -> str:
 
         try:
 
-            engine = PatternRecognitionEngine(app=None)
+            from zoneinfo import ZoneInfo
 
-            signals = engine.detect_from_candles(
-                recent_candles,
-                symbol=instrument_id,
+            india_tz = ZoneInfo("Asia/Kolkata")
+
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+            return timestamp.astimezone(india_tz).strftime("%Y-%m-%d")
+
+        except Exception:
+
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+            return timestamp.strftime("%Y-%m-%d")
+
+    # ========================================================
+    # ENSURE DAY
+    # ========================================================
+
+    def _ensure_day(
+        self,
+        instrument_id: str,
+        timestamp: datetime,
+    ) -> None:
+
+        day_key = self._india_day_key(timestamp)
+
+        previous_day = self._day_key.get(instrument_id)
+
+        if previous_day is not None and previous_day != day_key:
+
+            self._day_high.pop(
+                instrument_id,
+                None,
             )
 
-            if not signals:
-                return
+            self._day_low.pop(
+                instrument_id,
+                None,
+            )
 
-            signal = signals[0]
+            self._broker_day_synced[instrument_id] = False
 
-            payload: Dict[str, object] = {
-                "pattern": getattr(
-                    signal,
-                    "pattern",
-                    None,
+            if self._day_extreme_sentinel is not None:
+
+                try:
+                    self._day_extreme_sentinel.clear_symbol(instrument_id)
+
+                except Exception:
+                    logger.exception(
+                        "Failed to reset DayExtremePatternSentinel " "for new day | %s",
+                        instrument_id,
+                    )
+
+        self._day_key[instrument_id] = day_key
+
+    # ========================================================
+    # UPDATE DAY EXTREMES
+    # ========================================================
+
+    def _update_day_extremes(
+        self,
+        instrument_id: str,
+        timestamp: datetime,
+        price: float,
+    ) -> None:
+
+        try:
+            price = float(price)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return
+
+        if price <= 0:
+            return
+
+        self._ensure_day(
+            instrument_id,
+            timestamp,
+        )
+
+        # ----------------------------------------------------
+        # HIGH
+        # ----------------------------------------------------
+
+        current_high = self._day_high.get(instrument_id)
+
+        if current_high is None or price > current_high:
+
+            self._day_high[instrument_id] = price
+
+        # ----------------------------------------------------
+        # LOW
+        # ----------------------------------------------------
+
+        current_low = self._day_low.get(instrument_id)
+
+        if current_low is None or price < current_low:
+
+            self._day_low[instrument_id] = price
+
+    # ========================================================
+    # DAY HIGH
+    # ========================================================
+
+    def get_day_high(
+        self,
+        instrument_id: str,
+    ) -> Optional[float]:
+
+        with self._lock:
+
+            return self._day_high.get(instrument_id)
+
+    # ========================================================
+    # DAY LOW
+    # ========================================================
+
+    def get_day_low(
+        self,
+        instrument_id: str,
+    ) -> Optional[float]:
+
+        with self._lock:
+
+            return self._day_low.get(instrument_id)
+
+    # ========================================================
+    # DAY RANGE
+    # ========================================================
+
+    def get_day_range(
+        self,
+        instrument_id: str,
+    ) -> Optional[float]:
+
+        with self._lock:
+
+            high = self._day_high.get(instrument_id)
+
+            low = self._day_low.get(instrument_id)
+
+            if high is None or low is None:
+                return None
+
+            return high - low
+
+    # ========================================================
+    # DAY STATUS
+    # ========================================================
+
+    def get_day_status(
+        self,
+        instrument_id: str,
+    ) -> dict:
+
+        with self._lock:
+
+            high = self._day_high.get(instrument_id)
+
+            low = self._day_low.get(instrument_id)
+
+            return {
+                "symbol": instrument_id,
+                "date": self._day_key.get(instrument_id),
+                "day_high": high,
+                "day_low": low,
+                "day_range": (
+                    high - low if (high is not None and low is not None) else None
                 ),
-                "direction": getattr(
-                    signal,
-                    "direction",
-                    None,
-                ),
-                "confidence": getattr(
-                    signal,
-                    "confidence",
-                    0.0,
-                ),
-                "entry": getattr(
-                    signal,
-                    "entry",
-                    None,
-                ),
-                "stoploss": getattr(
-                    signal,
-                    "stoploss",
-                    None,
-                ),
-                "target": getattr(
-                    signal,
-                    "target",
-                    None,
-                ),
-                "timestamp": getattr(
-                    signal,
-                    "timestamp",
-                    None,
-                ),
-                "symbol": getattr(
-                    signal,
-                    "symbol",
-                    instrument_id,
+                "broker_synced": (
+                    self._broker_day_synced.get(
+                        instrument_id,
+                        False,
+                    )
                 ),
             }
-
-            logger.debug(
-                "PatternRecognitionEngine " "result for %s: %s",
-                instrument_id,
-                payload,
-            )
-
-            self._publish_pattern(
-                instrument_id,
-                payload,
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "PatternRecognitionEngine failed " "for %s: %s",
-                instrument_id,
-                exc,
-            )
 
     # ========================================================
     # FINALIZE
@@ -695,15 +968,6 @@ class CandleBuffer:
         self,
         instrument_id: Optional[str] = None,
     ) -> None:
-        """
-        Finalize the current unfinished candle.
-
-        Used by:
-        - historical replay
-        - testing
-        - shutdown
-        - end of session
-        """
 
         with self._lock:
 
@@ -726,16 +990,6 @@ class CandleBuffer:
                         current,
                     )
 
-                    logger.debug(
-                        "Finalized candle "
-                        "instrument=%s "
-                        "timestamp=%s "
-                        "candle_id=%s",
-                        symbol,
-                        current.timestamp,
-                        current.candle_id,
-                    )
-
                 return
 
             current = self._current.pop(
@@ -749,13 +1003,6 @@ class CandleBuffer:
             self._append_candle(
                 instrument_id,
                 current,
-            )
-
-            logger.debug(
-                "Finalized candle " "instrument=%s " "timestamp=%s " "candle_id=%s",
-                instrument_id,
-                current.timestamp,
-                current.candle_id,
             )
 
     # ========================================================
@@ -793,8 +1040,6 @@ class CandleBuffer:
 
             change_pct = ((ltp - previous_close) / previous_close) * 100.0
 
-        vwap = ltp
-
         if ltp > previous_close and previous_close != 0.0:
 
             color = "GREEN"
@@ -807,19 +1052,6 @@ class CandleBuffer:
 
             color = "DOJI"
 
-        (
-            body_strength,
-            upper_wick_pct,
-            lower_wick_pct,
-        ) = self._compute_strengths(
-            ltp,
-            ltp,
-            ltp,
-            ltp,
-        )
-
-        session_id = self._session_id[instrument_id]
-
         return Candle(
             timestamp=timestamp,
             open=ltp,
@@ -831,14 +1063,11 @@ class CandleBuffer:
             ticks=1,
             cum_volume=cum_volume,
             cum_price_volume=cum_price_volume,
-            vwap=vwap,
+            vwap=ltp,
             change_pct=change_pct,
             candle_id=candle_id,
-            session_id=session_id,
+            session_id=self._session_id[instrument_id],
             color=color,
-            body_strength=body_strength,
-            upper_wick_pct=upper_wick_pct,
-            lower_wick_pct=lower_wick_pct,
         )
 
     # ========================================================
@@ -892,10 +1121,6 @@ class CandleBuffer:
             ltp,
         )
 
-        # ====================================================
-        # TRUE VOLUME WEIGHTED PRICE
-        # ====================================================
-
         if cum_volume > 0.0:
 
             vwap = cum_price_volume / cum_volume
@@ -903,10 +1128,6 @@ class CandleBuffer:
         else:
 
             vwap = (high + low + ltp) / 3.0
-
-        # ====================================================
-        # COLOR
-        # ====================================================
 
         if ltp > current.open:
 
@@ -926,7 +1147,7 @@ class CandleBuffer:
             high=high,
             low=low,
             close=ltp,
-            volume=current.volume + volume_delta,
+            volume=(current.volume + volume_delta),
             previous_close=current.previous_close,
             ticks=current.ticks + 1,
             cum_volume=cum_volume,
@@ -967,11 +1188,7 @@ class CandleBuffer:
         high: float,
         low: float,
         close: float,
-    ) -> tuple[
-        float,
-        float,
-        float,
-    ]:
+    ) -> tuple[float, float, float]:
 
         range_value = high - low
 
@@ -987,7 +1204,11 @@ class CandleBuffer:
 
         upper_wick_pct = (
             max(
-                high - max(open_price, close),
+                high
+                - max(
+                    open_price,
+                    close,
+                ),
                 0.0,
             )
             / range_value
@@ -995,7 +1216,11 @@ class CandleBuffer:
 
         lower_wick_pct = (
             max(
-                min(open_price, close) - low,
+                min(
+                    open_price,
+                    close,
+                )
+                - low,
                 0.0,
             )
             / range_value
@@ -1032,7 +1257,7 @@ class CandleBuffer:
             return history[-count:]
 
     # ========================================================
-    # COMPLETED CANDLES ONLY
+    # COMPLETED CANDLES
     # ========================================================
 
     def get_completed(
@@ -1201,34 +1426,45 @@ class CandleBuffer:
             if current is not None:
                 history.append(current)
 
-        return [
-            {
-                "timestamp": candle.timestamp.isoformat(),
-                "open": candle.open,
-                "high": candle.high,
-                "low": candle.low,
-                "close": candle.close,
-                "volume": candle.volume,
-                "previous_close": candle.previous_close,
-                "ticks": candle.ticks,
-                "cum_volume": candle.cum_volume,
-                "cum_price_volume": candle.cum_price_volume,
-                "vwap": candle.vwap,
-                "change_pct": candle.change_pct,
-                "candle_id": candle.candle_id,
-                "session_id": candle.session_id,
-                "color": candle.color,
-                "body_strength": candle.body_strength,
-                "upper_wick_pct": candle.upper_wick_pct,
-                "lower_wick_pct": candle.lower_wick_pct,
-                "bullish": candle.bullish,
-                "bearish": candle.bearish,
-                "body": candle.body,
-                "upper_wick": candle.upper_wick,
-                "lower_wick": candle.lower_wick,
-            }
-            for candle in history
-        ]
+            day_high = self._day_high.get(instrument_id)
+
+            day_low = self._day_low.get(instrument_id)
+
+        rows = []
+
+        for candle in history:
+
+            rows.append(
+                {
+                    "timestamp": (candle.timestamp.isoformat()),
+                    "open": candle.open,
+                    "high": candle.high,
+                    "low": candle.low,
+                    "close": candle.close,
+                    "volume": candle.volume,
+                    "previous_close": (candle.previous_close),
+                    "ticks": candle.ticks,
+                    "cum_volume": (candle.cum_volume),
+                    "cum_price_volume": (candle.cum_price_volume),
+                    "vwap": candle.vwap,
+                    "change_pct": (candle.change_pct),
+                    "candle_id": (candle.candle_id),
+                    "session_id": (candle.session_id),
+                    "color": candle.color,
+                    "body_strength": (candle.body_strength),
+                    "upper_wick_pct": (candle.upper_wick_pct),
+                    "lower_wick_pct": (candle.lower_wick_pct),
+                    "bullish": candle.bullish,
+                    "bearish": candle.bearish,
+                    "body": candle.body,
+                    "upper_wick": (candle.upper_wick),
+                    "lower_wick": (candle.lower_wick),
+                    "day_high": day_high,
+                    "day_low": day_low,
+                }
+            )
+
+        return rows
 
     # ========================================================
     # CSV
@@ -1268,12 +1504,6 @@ class CandleBuffer:
 
                 csv_file.write(csv_text)
 
-            logger.info(
-                "Exported candle CSV " "for %s to %s",
-                instrument_id,
-                file_path,
-            )
-
         return csv_text
 
     # ========================================================
@@ -1303,154 +1533,7 @@ class CandleBuffer:
 
                 json_file.write(json_text)
 
-            logger.info(
-                "Exported candle JSON " "for %s to %s",
-                instrument_id,
-                file_path,
-            )
-
         return json_text
-
-    # ========================================================
-    # CLEAR
-    # ========================================================
-
-    def clear(
-        self,
-        instrument_id: Optional[str] = None,
-    ) -> None:
-
-        with self._lock:
-
-            if instrument_id is None:
-
-                self._history.clear()
-                self._current.clear()
-                self._last_volume.clear()
-                self._high_cache.clear()
-                self._low_cache.clear()
-                self._next_candle_id.clear()
-                self._session_id.clear()
-
-                if self._pattern_sentinel is not None:
-
-                    try:
-
-                        self._pattern_sentinel.clear()
-
-                    except Exception:
-
-                        logger.exception("Failed to reset " "M/W PatternSentinel")
-
-                logger.info("Cleared candle history " "for all instruments")
-
-                return
-
-            self._history.pop(
-                instrument_id,
-                None,
-            )
-
-            self._current.pop(
-                instrument_id,
-                None,
-            )
-
-            self._last_volume.pop(
-                instrument_id,
-                None,
-            )
-
-            self._high_cache.pop(
-                instrument_id,
-                None,
-            )
-
-            self._low_cache.pop(
-                instrument_id,
-                None,
-            )
-
-            self._next_candle_id.pop(
-                instrument_id,
-                None,
-            )
-
-            self._session_id.pop(
-                instrument_id,
-                None,
-            )
-
-            logger.info(
-                "Cleared candle history " "for %s",
-                instrument_id,
-            )
-
-    # ========================================================
-    # RESET SESSION
-    # ========================================================
-
-    def reset_session(
-        self,
-        instrument_id: Optional[str] = None,
-    ) -> None:
-        """
-        Start a new logical session.
-
-        Completed candle history is preserved.
-
-        Current unfinished candles are discarded.
-
-        Candle IDs continue increasing.
-
-        Session IDs increment.
-        """
-
-        with self._lock:
-
-            if instrument_id is None:
-
-                instrument_ids = set(self._history.keys())
-
-                instrument_ids.update(self._current.keys())
-
-                instrument_ids.update(self._session_id.keys())
-
-                for symbol in instrument_ids:
-
-                    self._session_id[symbol] += 1
-
-                self._current.clear()
-
-                logger.info("Reset session " "for all instruments")
-
-                return
-
-            self._session_id[instrument_id] += 1
-
-            self._current.pop(
-                instrument_id,
-                None,
-            )
-
-            logger.info(
-                "Reset session " "for %s -> session_id=%d",
-                instrument_id,
-                self._session_id[instrument_id],
-            )
-
-    # ========================================================
-    # SESSION ID
-    # ========================================================
-
-    def get_session_id(
-        self,
-        instrument_id: str,
-    ) -> int:
-
-        with self._lock:
-
-            return self._session_id[instrument_id]
 
     # ========================================================
     # CACHED HIGHS
@@ -1501,7 +1584,6 @@ class CandleBuffer:
     ) -> float:
 
         try:
-
             volume = float(volume)
 
         except (
@@ -1521,25 +1603,14 @@ class CandleBuffer:
         if previous is None:
             return volume
 
-        # ====================================================
-        # NORMAL CUMULATIVE VOLUME
-        # ====================================================
-
         delta = volume - previous
 
         if delta >= 0.0:
             return delta
 
-        # ====================================================
-        # VOLUME RESET
-        # ====================================================
-
-        logger.debug(
-            "Volume reset detected " "for %s: previous=%s current=%s",
-            instrument_id,
-            previous,
-            volume,
-        )
+        # ----------------------------------------------------
+        # BROKER VOLUME RESET
+        # ----------------------------------------------------
 
         return volume
 
@@ -1551,42 +1622,18 @@ class CandleBuffer:
         self,
         timestamp: datetime,
     ) -> datetime:
-        """
-        Align timestamp to the configured candle timeframe.
-
-        KiteLiveFeed converts incoming timestamps to UTC.
-
-        Therefore an aware UTC timestamp remains UTC.
-
-        Naive timestamps are treated as UTC.
-
-        No local-machine timezone conversion is performed.
-        """
 
         if timestamp is None:
 
             timestamp = datetime.now(timezone.utc)
 
-        # ====================================================
-        # AWARE TIMESTAMP
-        # ====================================================
-
         if timestamp.tzinfo is not None:
 
             epoch_seconds = int(timestamp.timestamp())
 
-            bucket_seconds = epoch_seconds - (epoch_seconds % self.timeframe)
+        else:
 
-            return datetime.fromtimestamp(
-                bucket_seconds,
-                tz=timezone.utc,
-            )
-
-        # ====================================================
-        # NAIVE TIMESTAMP
-        # ====================================================
-
-        epoch_seconds = int(timestamp.replace(tzinfo=timezone.utc).timestamp())
+            epoch_seconds = int(timestamp.replace(tzinfo=timezone.utc).timestamp())
 
         bucket_seconds = epoch_seconds - (epoch_seconds % self.timeframe)
 
@@ -1594,3 +1641,217 @@ class CandleBuffer:
             bucket_seconds,
             tz=timezone.utc,
         )
+
+    # ========================================================
+    # CLEAR
+    # ========================================================
+
+    def clear(
+        self,
+        instrument_id: Optional[str] = None,
+    ) -> None:
+
+        with self._lock:
+
+            if instrument_id is None:
+
+                self._history.clear()
+                self._current.clear()
+                self._last_volume.clear()
+                self._high_cache.clear()
+                self._low_cache.clear()
+                self._day_key.clear()
+                self._day_high.clear()
+                self._day_low.clear()
+                self._broker_day_synced.clear()
+                self._next_candle_id.clear()
+                self._session_id.clear()
+
+                if self._day_extreme_sentinel is not None:
+
+                    try:
+                        self._day_extreme_sentinel.clear()
+
+                    except Exception:
+
+                        logger.exception("Failed to reset " "DayExtremePatternSentinel")
+
+                return
+
+            self._history.pop(
+                instrument_id,
+                None,
+            )
+
+            self._current.pop(
+                instrument_id,
+                None,
+            )
+
+            self._last_volume.pop(
+                instrument_id,
+                None,
+            )
+
+            self._high_cache.pop(
+                instrument_id,
+                None,
+            )
+
+            self._low_cache.pop(
+                instrument_id,
+                None,
+            )
+
+            self._day_key.pop(
+                instrument_id,
+                None,
+            )
+
+            self._day_high.pop(
+                instrument_id,
+                None,
+            )
+
+            self._day_low.pop(
+                instrument_id,
+                None,
+            )
+
+            self._broker_day_synced.pop(
+                instrument_id,
+                None,
+            )
+
+            self._next_candle_id.pop(
+                instrument_id,
+                None,
+            )
+
+            self._session_id.pop(
+                instrument_id,
+                None,
+            )
+
+            if self._day_extreme_sentinel is not None:
+
+                try:
+                    self._day_extreme_sentinel.clear_symbol(instrument_id)
+
+                except Exception:
+
+                    logger.exception(
+                        "Failed to reset " "DayExtremePatternSentinel | %s",
+                        instrument_id,
+                    )
+
+    # ========================================================
+    # RESET SESSION
+    # ========================================================
+
+    def reset_session(
+        self,
+        instrument_id: Optional[str] = None,
+    ) -> None:
+
+        with self._lock:
+
+            if instrument_id is None:
+
+                instrument_ids = set(self._history.keys())
+
+                instrument_ids.update(self._current.keys())
+
+                instrument_ids.update(self._session_id.keys())
+
+                for symbol in instrument_ids:
+
+                    self._session_id[symbol] += 1
+
+                    self._day_key.pop(
+                        symbol,
+                        None,
+                    )
+
+                    self._day_high.pop(
+                        symbol,
+                        None,
+                    )
+
+                    self._day_low.pop(
+                        symbol,
+                        None,
+                    )
+
+                    self._broker_day_synced.pop(
+                        symbol,
+                        None,
+                    )
+
+                    if self._day_extreme_sentinel is not None:
+
+                        try:
+                            self._day_extreme_sentinel.clear_symbol(symbol)
+
+                        except Exception:
+
+                            logger.exception(
+                                "Failed to reset " "DayExtremePatternSentinel | %s",
+                                symbol,
+                            )
+
+                self._current.clear()
+
+                return
+
+            self._session_id[instrument_id] += 1
+
+            self._current.pop(
+                instrument_id,
+                None,
+            )
+
+            self._day_key.pop(
+                instrument_id,
+                None,
+            )
+
+            self._day_high.pop(
+                instrument_id,
+                None,
+            )
+
+            self._day_low.pop(
+                instrument_id,
+                None,
+            )
+
+            self._broker_day_synced.pop(
+                instrument_id,
+                None,
+            )
+
+            if self._day_extreme_sentinel is not None:
+
+                try:
+                    self._day_extreme_sentinel.clear_symbol(instrument_id)
+
+                except Exception:
+
+                    logger.exception(
+                        "Failed to reset " "DayExtremePatternSentinel | %s",
+                        instrument_id,
+                    )
+
+    # ========================================================
+    # SESSION ID
+    # ========================================================
+
+    def get_session_id(
+        self,
+        instrument_id: str,
+    ) -> int:
+
+        with self._lock:
+
+            return self._session_id[instrument_id]
