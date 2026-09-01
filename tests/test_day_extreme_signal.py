@@ -266,19 +266,52 @@ def test_signal_cooling_alert_emits_once_per_cycle(capsys) -> None:
     feed = object.__new__(KiteLiveFeed)
     feed.day_extreme_sentinel = DayExtremePatternSentinel()
     feed._last_snapshots = {
-        "NIFTY": type(
+        "SENSEX": type(
             "Snapshot",
             (),
             {"ltp": 101.0},
         )()
     }
-    feed._last_signal_direction = {"NIFTY": "BUY"}
+    feed._last_signal_direction = {"SENSEX": "BUY"}
     feed._signal_cooling_notified = {}
 
-    feed._maybe_emit_cooled_signal_alert("NIFTY")
+    feed._maybe_emit_cooled_signal_alert("SENSEX")
     first = capsys.readouterr().out
-    assert "BUY SIGNAL COOLED" in first
+    assert "BUY SIGNAL LOST STRENGTH" in first
 
-    feed._maybe_emit_cooled_signal_alert("NIFTY")
+    feed._maybe_emit_cooled_signal_alert("SENSEX")
     second = capsys.readouterr().out
-    assert "BUY SIGNAL COOLED" not in second
+    assert "BUY SIGNAL LOST STRENGTH" not in second
+
+    feed._last_signal_direction = {"SENSEX": "SELL"}
+    feed._signal_cooling_notified.pop("SENSEX", None)
+
+    feed._maybe_emit_cooled_signal_alert("SENSEX")
+    sell_output = capsys.readouterr().out
+    assert "SELL SIGNAL LOST STRENGTH" in sell_output
+
+
+def test_live_feed_alerts_only_sensex() -> None:
+    feed = KiteLiveFeed(instrument_ids=["NIFTY", "BANKNIFTY", "SENSEX"])
+
+    assert feed.instrument_ids == ["SENSEX"]
+    assert feed._is_active_alert_symbol("SENSEX") is True
+    assert feed._is_active_alert_symbol("NIFTY") is False
+    assert feed._is_active_alert_symbol("BANKNIFTY") is False
+
+
+def test_verdict_analysis_distinguishes_close_bad_from_active_useful_signal() -> None:
+    from eod_signal_report import evaluate_signal_verdict
+
+    verdict = evaluate_signal_verdict(
+        direction="BUY",
+        entry_price=100.0,
+        close_price=99.0,
+        active_move_pct=1.25,
+        threshold_pct=0.05,
+    )
+
+    assert verdict["close_verdict"] == "BAD"
+    assert verdict["lifecycle_verdict"] == "USEFUL_ACTIVE"
+    assert verdict["active_move_pct"] == 1.25
+    assert verdict["threshold_pct"] == 0.05

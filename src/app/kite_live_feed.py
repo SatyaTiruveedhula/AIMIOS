@@ -48,8 +48,6 @@ IST = ZoneInfo("Asia/Kolkata")
 # ============================================================
 
 DEFAULT_INSTRUMENT_IDS = [
-    "NIFTY",
-    "BANKNIFTY",
     "SENSEX",
 ]
 
@@ -91,13 +89,20 @@ ENABLE_BROKER_SYNC_PRINT = False
 
 class KiteLiveFeed:
 
+    @staticmethod
+    def _is_active_alert_symbol(symbol: Optional[str]) -> bool:
+        return str(symbol or "").upper() == "SENSEX"
+
     def __init__(
         self,
         instrument_ids: Optional[List[str]] = None,
         candle_buffer: Optional[CandleBuffer] = None,
     ) -> None:
 
-        self.instrument_ids = instrument_ids or DEFAULT_INSTRUMENT_IDS
+        requested = instrument_ids or DEFAULT_INSTRUMENT_IDS
+        self.instrument_ids = [
+            symbol for symbol in requested if self._is_active_alert_symbol(symbol)
+        ] or ["SENSEX"]
 
         # ====================================================
         # BROKER
@@ -876,11 +881,8 @@ class KiteLiveFeed:
             self._last_15min_snapshot_epoch = time.time()
             return
 
-        now = time.time()
-
-        if now - self._last_15min_snapshot_epoch >= 900:
-            self._last_15min_snapshot_epoch = now
-            self._print_minimal_market_snapshot()
+        # TEMPORARILY disabled: no periodic 15-minute snapshot prints.
+        return
 
     # ========================================================
     # STOP
@@ -1394,6 +1396,9 @@ class KiteLiveFeed:
         symbol: str,
     ) -> None:
 
+        if not self._is_active_alert_symbol(symbol):
+            return
+
         direction = self._last_signal_direction.get(symbol)
 
         if not direction:
@@ -1419,7 +1424,7 @@ class KiteLiveFeed:
 
         print("")
         print("=" * 60)
-        print(f"{direction} SIGNAL COOLED")
+        print(f"{direction} SIGNAL LOST STRENGTH")
         print(f"SYMBOL     : {symbol}")
         print(f"PRICE      : {price}")
         print("STATUS     : setup lost strength; waiting for a fresh signal")
@@ -1440,6 +1445,9 @@ class KiteLiveFeed:
     ) -> None:
 
         if not alert:
+            return
+
+        if not self._is_active_alert_symbol(symbol):
             return
 
         timestamp_value = alert.get("timestamp")
