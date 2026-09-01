@@ -19,6 +19,13 @@ def test_snapshot_watch_status_reports_active_sell_and_buy_setup() -> None:
     feed = object.__new__(KiteLiveFeed)
     sentinel = DayExtremePatternSentinel()
     feed.day_extreme_sentinel = sentinel
+    feed._last_snapshots = {
+        "NIFTY": type(
+            "Snapshot",
+            (),
+            {"ltp": 99.95},
+        )()
+    }
 
     sentinel._m_setup["NIFTY"] = type(
         "Setup",
@@ -54,11 +61,8 @@ def test_snapshot_watch_status_reports_active_sell_and_buy_setup() -> None:
     assert "SELL WATCH" in status
     assert "H1=100.00" in status
     assert "VALLEY=99.00" in status
-    assert "WAITING FOR HIGH2" in status
-    assert "BUY WATCH" in status
-    assert "L1=98.00" in status
-    assert "PEAK=99.50" in status
-    assert "WAITING FOR LOW2" in status
+    assert "WAITING FOR SELL REVERSAL" in status
+    assert "BUY WATCH" not in status
 
 
 def test_merge_signal_alerts_keeps_only_best_buy_and_sell() -> None:
@@ -118,3 +122,46 @@ def test_merge_signal_alerts_keeps_only_best_buy_and_sell() -> None:
         max(alert["confidence"] for alert in merged if alert["direction"] == "SELL")
         == 91.0
     )
+
+
+def test_watch_status_only_prints_near_reversal() -> None:
+    feed = object.__new__(KiteLiveFeed)
+    sentinel = DayExtremePatternSentinel()
+    feed.day_extreme_sentinel = sentinel
+    feed._last_snapshots = {
+        "NIFTY": type(
+            "Snapshot",
+            (),
+            {"ltp": 99.95},
+        )()
+    }
+
+    sentinel._m_setup["NIFTY"] = type(
+        "Setup",
+        (),
+        {
+            "high1": 100.0,
+            "high1_timestamp": None,
+            "high1_candle_id": 1,
+            "valley": 99.0,
+            "valley_timestamp": None,
+            "valley_candle_id": 2,
+            "waiting_printed": True,
+            "active": True,
+        },
+    )()
+
+    status = feed._build_instrument_watch_status("NIFTY")
+
+    assert "SELL WATCH" in status
+    assert "WAITING FOR SELL REVERSAL" in status
+
+    feed._last_snapshots = {
+        "NIFTY": type(
+            "Snapshot",
+            (),
+            {"ltp": 90.0},
+        )()
+    }
+    status_far = feed._build_instrument_watch_status("NIFTY")
+    assert status_far == "WATCH | NONE"

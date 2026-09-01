@@ -517,31 +517,60 @@ class KiteLiveFeed:
         sell_setup = self.day_extreme_sentinel.get_m_setup(instrument_id)
         buy_setup = self.day_extreme_sentinel.get_w_setup(instrument_id)
 
+        snapshot = (
+            self._last_snapshots.get(instrument_id)
+            if hasattr(self, "_last_snapshots")
+            else None
+        )
+        current_price = None
+
+        if snapshot is not None:
+            try:
+                current_price = float(snapshot.ltp)
+            except AttributeError, TypeError, ValueError:
+                current_price = None
+
+        def _near_reversal(
+            reference: float, current: float, threshold_pct: float = 0.05
+        ) -> bool:
+            if reference <= 0 or current <= 0:
+                return False
+            gap_pct = abs(current - reference) / reference * 100.0
+            return gap_pct <= threshold_pct
+
         if sell_setup:
             high1 = sell_setup.get("high1")
             valley = sell_setup.get("valley")
-            if high1 is not None and valley is not None:
+            if (
+                high1 is not None
+                and current_price is not None
+                and _near_reversal(high1, current_price)
+            ):
+                valley_text = (
+                    f"VALLEY={valley:.2f}" if valley is not None else "VALLEY=NA"
+                )
                 status_parts.append(
                     "SELL WATCH | "
                     f"H1={high1:.2f} | "
-                    f"VALLEY={valley:.2f} | "
-                    "WAITING FOR HIGH2"
+                    f"{valley_text} | "
+                    "WAITING FOR SELL REVERSAL"
                 )
-            else:
-                status_parts.append("SELL WATCH | WAITING FOR HIGH1")
 
         if buy_setup:
             low1 = buy_setup.get("low1")
             peak = buy_setup.get("peak")
-            if low1 is not None and peak is not None:
+            if (
+                low1 is not None
+                and current_price is not None
+                and _near_reversal(low1, current_price)
+            ):
+                peak_text = f"PEAK={peak:.2f}" if peak is not None else "PEAK=NA"
                 status_parts.append(
                     "BUY WATCH | "
                     f"L1={low1:.2f} | "
-                    f"PEAK={peak:.2f} | "
-                    "WAITING FOR LOW2"
+                    f"{peak_text} | "
+                    "WAITING FOR BUY REVERSAL"
                 )
-            else:
-                status_parts.append("BUY WATCH | WAITING FOR LOW1")
 
         if not status_parts:
             return "WATCH | NONE"
