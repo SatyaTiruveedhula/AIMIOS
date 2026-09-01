@@ -169,7 +169,7 @@ class CandleBuffer:
         # ----------------------------------------------------
         # DAY EXTREME PATTERN SENTINEL
         #
-        # This is the NEW M/W detector.
+        # This is the M/W detector.
         #
         # It is deliberately separate from the old
         # PatternSentinel.
@@ -187,10 +187,8 @@ class CandleBuffer:
 
             self._day_extreme_sentinel = DayExtremePatternSentinel()
 
-            logger.info("DayExtremePatternSentinel initialized")
-
         except Exception:
-            logger.exception("Failed to initialize " "DayExtremePatternSentinel")
+            logger.exception("Failed to initialize DayExtremePatternSentinel")
 
             self._day_extreme_sentinel = None
 
@@ -204,12 +202,6 @@ class CandleBuffer:
         # ----------------------------------------------------
 
         self._pattern_detector = pattern_detector
-
-        logger.info(
-            "Initialized CandleBuffer(" "max_candles=%d, timeframe=%ds)",
-            self.max_candles,
-            self.timeframe,
-        )
 
     # ========================================================
     # SUBSCRIPTIONS
@@ -349,13 +341,12 @@ class CandleBuffer:
 
             self._broker_day_synced[instrument_id] = True
 
-        logger.info(
-            "Broker Day OHLC synchronized | " "%s | date=%s | high=%s | low=%s",
-            instrument_id,
-            day_key,
-            high_price,
-            low_price,
-        )
+        # ----------------------------------------------------
+        # INTENTIONALLY NO CONSOLE OUTPUT HERE.
+        #
+        # Broker synchronization is normal operation and
+        # should remain silent.
+        # ----------------------------------------------------
 
     # ========================================================
     # BROKER SYNC STATUS
@@ -441,6 +432,7 @@ class CandleBuffer:
 
         try:
             ltp = float(snapshot.ltp)
+
         except TypeError, ValueError:
             return
 
@@ -713,6 +705,7 @@ class CandleBuffer:
                             0.0,
                         )
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -735,7 +728,10 @@ class CandleBuffer:
                 )
 
                 # ------------------------------------------------
-                # LOG
+                # ONLY REAL ALERT PRINT
+                #
+                # This is intentionally the ONLY normal
+                # CandleBuffer console/log output.
                 # ------------------------------------------------
 
                 logger.warning(
@@ -763,6 +759,8 @@ class CandleBuffer:
 
         except Exception:
 
+            # Errors are retained because silent failures would
+            # make the detector impossible to diagnose.
             logger.exception(
                 "DayExtremePatternSentinel failed for %s",
                 instrument_id,
@@ -849,6 +847,7 @@ class CandleBuffer:
 
         try:
             price = float(price)
+
         except (
             TypeError,
             ValueError,
@@ -1436,29 +1435,29 @@ class CandleBuffer:
 
             rows.append(
                 {
-                    "timestamp": (candle.timestamp.isoformat()),
+                    "timestamp": candle.timestamp.isoformat(),
                     "open": candle.open,
                     "high": candle.high,
                     "low": candle.low,
                     "close": candle.close,
                     "volume": candle.volume,
-                    "previous_close": (candle.previous_close),
+                    "previous_close": candle.previous_close,
                     "ticks": candle.ticks,
-                    "cum_volume": (candle.cum_volume),
-                    "cum_price_volume": (candle.cum_price_volume),
+                    "cum_volume": candle.cum_volume,
+                    "cum_price_volume": candle.cum_price_volume,
                     "vwap": candle.vwap,
-                    "change_pct": (candle.change_pct),
-                    "candle_id": (candle.candle_id),
-                    "session_id": (candle.session_id),
+                    "change_pct": candle.change_pct,
+                    "candle_id": candle.candle_id,
+                    "session_id": candle.session_id,
                     "color": candle.color,
-                    "body_strength": (candle.body_strength),
-                    "upper_wick_pct": (candle.upper_wick_pct),
-                    "lower_wick_pct": (candle.lower_wick_pct),
+                    "body_strength": candle.body_strength,
+                    "upper_wick_pct": candle.upper_wick_pct,
+                    "lower_wick_pct": candle.lower_wick_pct,
                     "bullish": candle.bullish,
                     "bearish": candle.bearish,
                     "body": candle.body,
-                    "upper_wick": (candle.upper_wick),
-                    "lower_wick": (candle.lower_wick),
+                    "upper_wick": candle.upper_wick,
+                    "lower_wick": candle.lower_wick,
                     "day_high": day_high,
                     "day_low": day_low,
                 }
@@ -1796,7 +1795,9 @@ class CandleBuffer:
                         except Exception:
 
                             logger.exception(
-                                "Failed to reset " "DayExtremePatternSentinel | %s",
+                                "Failed to reset "
+                                "DayExtremePatternSentinel "
+                                "for new session | %s",
                                 symbol,
                             )
 
@@ -1839,7 +1840,9 @@ class CandleBuffer:
                 except Exception:
 
                     logger.exception(
-                        "Failed to reset " "DayExtremePatternSentinel | %s",
+                        "Failed to reset "
+                        "DayExtremePatternSentinel "
+                        "for new session | %s",
                         instrument_id,
                     )
 

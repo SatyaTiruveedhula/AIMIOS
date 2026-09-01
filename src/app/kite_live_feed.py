@@ -4,17 +4,24 @@ import csv
 import logging
 import signal
 import time
-from datetime import datetime, timezone
+
+from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from broker.kite_feed import KiteFeed
+
 from aimios.market.candle_buffer import CandleBuffer
 from aimios.market.market_feed import MarketFeed
 from aimios.market.market_snapshot import (
     MarketSnapshot,
     MarketStatus,
+)
+
+from aimios.engines.day_extreme_pattern_sentinel import (
+    DayExtremePatternSentinel,
 )
 
 try:
@@ -25,13 +32,60 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# PROJECT
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+# ============================================================
+# DEFAULT INSTRUMENTS
+# ============================================================
 
 DEFAULT_INSTRUMENT_IDS = [
     "NIFTY",
     "BANKNIFTY",
     "SENSEX",
 ]
+
+
+# ============================================================
+# OUTPUT CONTROL
+# ============================================================
+#
+# IMPORTANT:
+#
+# Health output was previously printed every 5 seconds.
+# This created continuous output such as:
+#
+#   [AIMIOS HEALTH]
+#   NIFTY: LTP=...
+#   BANKNIFTY: LTP=...
+#   SENSEX: LTP=...
+#
+# That output is now disabled.
+#
+# AIMIOS will print only important operational messages
+# and actual pattern alerts.
+#
+# ============================================================
+
+ENABLE_HEALTH_PRINT = False
+
+ENABLE_RAW_TICK_PRINT = False
+
+ENABLE_FIRST_TICK_PRINT = False
+
+ENABLE_BROKER_SYNC_PRINT = False
+
+
+# ============================================================
+# KITE LIVE FEED
+# ============================================================
 
 
 class KiteLiveFeed:
@@ -56,7 +110,19 @@ class KiteLiveFeed:
 
         self.candle_buffer = candle_buffer or CandleBuffer()
 
+        # ----------------------------------------------------
+        # EXISTING M/W PATTERN
+        #
+        # DO NOT REMOVE
+        # ----------------------------------------------------
+
         self.candle_buffer.subscribe_pattern(self._on_pattern_detected)
+
+        # ====================================================
+        # DAY EXTREME SENTINEL
+        # ====================================================
+
+        self.day_extreme_sentinel = DayExtremePatternSentinel()
 
         # ====================================================
         # THREAD / CONTROL
@@ -71,7 +137,7 @@ class KiteLiveFeed:
         self._tick_lock = Lock()
 
         # ====================================================
-        # PATTERN LOG
+        # EXISTING PATTERN LOG
         # ====================================================
 
         self.pattern_log_path = PROJECT_ROOT / "logs" / "patterns.csv"
@@ -82,6 +148,19 @@ class KiteLiveFeed:
         )
 
         self._ensure_pattern_log_header()
+
+        # ====================================================
+        # DAY EXTREME LOG
+        # ====================================================
+
+        self.day_extreme_log_path = PROJECT_ROOT / "logs" / "day_extremes.csv"
+
+        self.day_extreme_log_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self._ensure_day_extreme_log_header()
 
         # ====================================================
         # SUBSCRIPTIONS
@@ -102,7 +181,7 @@ class KiteLiveFeed:
         self._subscription_symbols = self._build_subscriptions()
 
         # ====================================================
-        # HEALTH
+        # HEALTH / TICK STATE
         # ====================================================
 
         self._tick_count = 0
@@ -119,7 +198,16 @@ class KiteLiveFeed:
             float,
         ] = {}
 
+        self._last_snapshots: Dict[
+            str,
+            MarketSnapshot,
+        ] = {}
+
         self._last_health_print = 0.0
+
+        self._snapshot_printed_initial = False
+
+        self._last_15min_snapshot_epoch = 0.0
 
         # ====================================================
         # BROKER DAY OHLC
@@ -128,6 +216,18 @@ class KiteLiveFeed:
         self._broker_ohlc_seen: Dict[
             str,
             bool,
+        ] = {}
+
+        # ====================================================
+        # DAY EXTREME STATE
+        #
+        # Only completed candles are sent to the
+        # DayExtremePatternSentinel.
+        # ====================================================
+
+        self._last_processed_candle_id: Dict[
+            str,
+            int,
         ] = {}
 
         # ====================================================
@@ -176,7 +276,7 @@ class KiteLiveFeed:
         return symbols
 
     # ========================================================
-    # CSV HEADER
+    # EXISTING PATTERN CSV HEADER
     # ========================================================
 
     def _ensure_pattern_log_header(
@@ -208,16 +308,58 @@ class KiteLiveFeed:
             writer.writeheader()
 
     # ========================================================
+    # DAY EXTREME CSV HEADER
+    # ========================================================
+
+    def _ensure_day_extreme_log_header(
+        self,
+    ) -> None:
+
+        if self.day_extreme_log_path.exists():
+            return
+
+        with self.day_extreme_log_path.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as csv_file:
+
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=[
+                    "timestamp",
+                    "symbol",
+                    "pattern",
+                    "direction",
+                    "confidence",
+                    "price",
+                    "day_high",
+                    "day_low",
+                    "high1",
+                    "valley",
+                    "high2",
+                    "low1",
+                    "peak",
+                    "low2",
+                ],
+            )
+
+            writer.writeheader()
+
+    # ========================================================
     # START
     # ========================================================
 
-    def start(self) -> None:
+    def start(
+        self,
+    ) -> None:
 
         if KiteTicker is None:
 
             raise RuntimeError("kiteconnect is not installed")
 
         self._stop_event.clear()
+
         self._ready.clear()
 
         print("")
@@ -259,8 +401,11 @@ class KiteLiveFeed:
         )
 
         self._ticker.on_ticks = self._on_ticks
+
         self._ticker.on_connect = self._on_connect
+
         self._ticker.on_close = self._on_close
+
         self._ticker.on_error = self._on_error
 
         # ----------------------------------------------------
@@ -298,29 +443,202 @@ class KiteLiveFeed:
 
         print("")
         print("=" * 60)
-        print("AIMIOS Live Feed Running...")
+        print("AIMIOS LIVE FEED RUNNING")
+        print("=" * 60)
         print("Broker Day OHLC synchronization enabled.")
-        print("M/W pattern detection enabled.")
-        print("Waiting for live ticks...")
+        print("Existing M/W pattern detection enabled.")
+        print("DAY HIGH / DAY LOW detection enabled.")
+        print("DAY EXTREME M/W detection enabled.")
+        print("Continuous health output disabled.")
+        print("Waiting for pattern alerts...")
         print("=" * 60)
         print("")
 
         # ----------------------------------------------------
-        # HEALTH LOOP
+        # MAIN WAIT LOOP
+        #
+        # IMPORTANT:
+        #
+        # Previously this loop called _print_health()
+        # every 5 seconds.
+        #
+        # That caused the repeated output the user was seeing.
+        #
+        # We now simply wait for the feed to stop.
         # ----------------------------------------------------
 
-        while not self._stop_event.wait(timeout=5):
+        while not self._stop_event.wait(timeout=1):
 
-            self._print_health()
+            pass
 
         print("")
         print("Live feed loop exited.")
+
+    def _print_complete_market_snapshot(
+        self,
+    ) -> None:
+
+        if not self._last_snapshots:
+            print("[MARKET SNAPSHOT] No market data yet.")
+            return
+
+        print("")
+        print("=" * 80)
+        print("COMPLETE MARKET SNAPSHOT")
+        print("=" * 80)
+
+        for instrument_id in sorted(self.instrument_ids):
+            snapshot = self._last_snapshots.get(instrument_id)
+
+            if snapshot is None:
+                continue
+
+            print(
+                f"{instrument_id:>12} | "
+                f"LTP={snapshot.ltp:,.2f} | "
+                f"OPEN={snapshot.open:,.2f} | "
+                f"HIGH={snapshot.high:,.2f} | "
+                f"LOW={snapshot.low:,.2f} | "
+                f"CLOSE={snapshot.close:,.2f} | "
+                f"VOL={snapshot.volume:,.0f} | "
+                f"TIME={snapshot.timestamp.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        print("=" * 80)
+        print("")
+
+    def _build_instrument_watch_status(
+        self,
+        instrument_id: str,
+    ) -> str:
+
+        status_parts: List[str] = []
+
+        sell_setup = self.day_extreme_sentinel.get_m_setup(instrument_id)
+        buy_setup = self.day_extreme_sentinel.get_w_setup(instrument_id)
+
+        if sell_setup:
+            high1 = sell_setup.get("high1")
+            valley = sell_setup.get("valley")
+            if high1 is not None and valley is not None:
+                status_parts.append(
+                    "SELL WATCH | "
+                    f"H1={high1:.2f} | "
+                    f"VALLEY={valley:.2f} | "
+                    "WAITING FOR HIGH2"
+                )
+            else:
+                status_parts.append("SELL WATCH | WAITING FOR HIGH1")
+
+        if buy_setup:
+            low1 = buy_setup.get("low1")
+            peak = buy_setup.get("peak")
+            if low1 is not None and peak is not None:
+                status_parts.append(
+                    "BUY WATCH | "
+                    f"L1={low1:.2f} | "
+                    f"PEAK={peak:.2f} | "
+                    "WAITING FOR LOW2"
+                )
+            else:
+                status_parts.append("BUY WATCH | WAITING FOR LOW1")
+
+        if not status_parts:
+            return "WATCH | NONE"
+
+        return " | ".join(status_parts)
+
+    def _print_minimal_market_snapshot(
+        self,
+    ) -> None:
+
+        if not self._last_snapshots:
+            return
+
+        print("")
+        print("=" * 60)
+        print("15 MIN MARKET SNAPSHOT")
+        print("=" * 60)
+
+        for instrument_id in sorted(self.instrument_ids):
+            snapshot = self._last_snapshots.get(instrument_id)
+
+            if snapshot is None:
+                continue
+
+            print(
+                f"{instrument_id:>12} | "
+                f"LTP={snapshot.ltp:,.2f} | "
+                f"HIGH={snapshot.high:,.2f} | "
+                f"LOW={snapshot.low:,.2f} | "
+                f"VOL={snapshot.volume:,.0f}"
+            )
+
+            watch_status = self._build_instrument_watch_status(instrument_id)
+            print(f"{instrument_id:>12} | {watch_status}")
+
+        print("=" * 60)
+        print("")
+
+    def _print_complete_market_snapshot(
+        self,
+    ) -> None:
+
+        if not self._last_snapshots:
+            print("[MARKET SNAPSHOT] No market data yet.")
+            return
+
+        print("")
+        print("=" * 80)
+        print("COMPLETE MARKET SNAPSHOT")
+        print("=" * 80)
+
+        for instrument_id in sorted(self.instrument_ids):
+            snapshot = self._last_snapshots.get(instrument_id)
+
+            if snapshot is None:
+                continue
+
+            print(
+                f"{instrument_id:>12} | "
+                f"LTP={snapshot.ltp:,.2f} | "
+                f"OPEN={snapshot.open:,.2f} | "
+                f"HIGH={snapshot.high:,.2f} | "
+                f"LOW={snapshot.low:,.2f} | "
+                f"CLOSE={snapshot.close:,.2f} | "
+                f"VOL={snapshot.volume:,.0f} | "
+                f"TIME={snapshot.timestamp.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+            watch_status = self._build_instrument_watch_status(instrument_id)
+            print(f"{instrument_id:>12} | {watch_status}")
+
+        print("=" * 80)
+        print("")
+
+    def _maybe_print_snapshots(
+        self,
+    ) -> None:
+
+        if not self._snapshot_printed_initial and self._last_snapshots:
+            self._snapshot_printed_initial = True
+            self._print_complete_market_snapshot()
+            self._last_15min_snapshot_epoch = time.time()
+            return
+
+        now = time.time()
+
+        if now - self._last_15min_snapshot_epoch >= 900:
+            self._last_15min_snapshot_epoch = now
+            self._print_minimal_market_snapshot()
 
     # ========================================================
     # STOP
     # ========================================================
 
-    def stop(self) -> None:
+    def stop(
+        self,
+    ) -> None:
 
         self._stop_event.set()
 
@@ -454,10 +772,7 @@ class KiteLiveFeed:
                 self._instrument_id_by_token[token] = instrument_id
 
         # ----------------------------------------------------
-        # FALLBACK TOKEN MAPPING
-        #
-        # These are the confirmed tokens currently being
-        # subscribed by AIMIOS.
+        # FALLBACK
         # ----------------------------------------------------
 
         fallback_token_map = {
@@ -527,10 +842,10 @@ class KiteLiveFeed:
         # ----------------------------------------------------
         # RAW TICK DIAGNOSTIC
         #
-        # Print only once so the console is not flooded.
+        # DISABLED BY DEFAULT
         # ----------------------------------------------------
 
-        if not self._raw_tick_printed:
+        if ENABLE_RAW_TICK_PRINT and not self._raw_tick_printed:
 
             self._raw_tick_printed = True
 
@@ -546,14 +861,13 @@ class KiteLiveFeed:
 
             self._tick_count += len(ticks)
 
-            self._last_tick_time = datetime.now(timezone.utc)
+            self._last_tick_time = datetime.now(IST)
 
         for tick in ticks:
 
             instrument_id = self._resolve_instrument_id(tick)
 
             if instrument_id is None:
-
                 continue
 
             # ------------------------------------------------
@@ -576,10 +890,12 @@ class KiteLiveFeed:
 
                 self._first_tick_seen[instrument_id] = True
 
-                self._print_first_tick(
-                    instrument_id,
-                    tick,
-                )
+                if ENABLE_FIRST_TICK_PRINT:
+
+                    self._print_first_tick(
+                        instrument_id,
+                        tick,
+                    )
 
             # ------------------------------------------------
             # SNAPSHOT
@@ -593,8 +909,20 @@ class KiteLiveFeed:
                 )
 
                 self._last_prices[instrument_id] = snapshot.ltp
+                self._last_snapshots[instrument_id] = snapshot
+                self._maybe_print_snapshots()
+
+                # --------------------------------------------
+                # EXISTING CANDLE ENGINE
+                # --------------------------------------------
 
                 self.candle_buffer.update(snapshot)
+
+                # --------------------------------------------
+                # DAY EXTREME ENGINE
+                # --------------------------------------------
+
+                self._process_day_extreme_engine(instrument_id)
 
             except Exception:
 
@@ -602,6 +930,401 @@ class KiteLiveFeed:
                     "Failed processing tick for %s",
                     instrument_id,
                 )
+
+    # ========================================================
+    # DAY EXTREME ENGINE
+    # ========================================================
+
+    def _process_day_extreme_engine(
+        self,
+        instrument_id: str,
+    ) -> None:
+        """
+        Run DayExtremePatternSentinel only when a NEW
+        COMPLETED candle is available.
+
+        This does NOT run the pattern engine on every tick.
+        """
+
+        try:
+
+            # ------------------------------------------------
+            # DAY EXTREMES
+            # ------------------------------------------------
+
+            day_high = self.candle_buffer.get_day_high(instrument_id)
+
+            day_low = self.candle_buffer.get_day_low(instrument_id)
+
+            if day_high is None or day_low is None:
+
+                return
+
+            # ------------------------------------------------
+            # GET CANDLE HISTORY
+            # ------------------------------------------------
+
+            candles = None
+
+            if hasattr(
+                self.candle_buffer,
+                "get_candles",
+            ):
+
+                try:
+
+                    candles = self.candle_buffer.get_candles(instrument_id)
+
+                except TypeError:
+
+                    candles = self.candle_buffer.get_candles()
+
+            elif hasattr(
+                self.candle_buffer,
+                "get_history",
+            ):
+
+                try:
+
+                    candles = self.candle_buffer.get_history(instrument_id)
+
+                except TypeError:
+
+                    candles = self.candle_buffer.get_history()
+
+            elif hasattr(
+                self.candle_buffer,
+                "history",
+            ):
+
+                history = self.candle_buffer.history
+
+                if isinstance(
+                    history,
+                    dict,
+                ):
+
+                    candles = history.get(
+                        instrument_id,
+                        [],
+                    )
+
+                else:
+
+                    candles = history
+
+            # ------------------------------------------------
+            # LAST RESORT
+            # ------------------------------------------------
+
+            if candles is None:
+
+                history = getattr(
+                    self.candle_buffer,
+                    "_history",
+                    None,
+                )
+
+                if isinstance(
+                    history,
+                    dict,
+                ):
+
+                    candles = history.get(
+                        instrument_id,
+                        [],
+                    )
+
+                elif history is not None:
+
+                    candles = history
+
+            if not candles:
+
+                return
+
+            candles = list(candles)
+
+            if not candles:
+
+                return
+
+            # ------------------------------------------------
+            # LAST COMPLETED CANDLE
+            # ------------------------------------------------
+
+            candle = candles[-1]
+
+            try:
+
+                candle_id = int(
+                    getattr(
+                        candle,
+                        "candle_id",
+                        0,
+                    )
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                return
+
+            if candle_id <= 0:
+
+                return
+
+            # ------------------------------------------------
+            # DO NOT PROCESS SAME CANDLE AGAIN
+            # ------------------------------------------------
+
+            previous_id = self._last_processed_candle_id.get(instrument_id)
+
+            if previous_id is not None and candle_id <= previous_id:
+
+                return
+
+            # ------------------------------------------------
+            # MARK CANDLE PROCESSED
+            # ------------------------------------------------
+
+            self._last_processed_candle_id[instrument_id] = candle_id
+
+            # ------------------------------------------------
+            # PROCESS
+            # ------------------------------------------------
+
+            alerts = self.day_extreme_sentinel.process_candle(
+                symbol=instrument_id,
+                candle=candle,
+                candles=candles,
+                day_high=day_high,
+                day_low=day_low,
+            )
+
+            # ------------------------------------------------
+            # HANDLE ONLY ACTUAL ALERTS
+            # ------------------------------------------------
+
+            for alert in alerts:
+
+                self._on_day_extreme_alert(
+                    instrument_id,
+                    alert,
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Day extreme processing failed for %s",
+                instrument_id,
+            )
+
+    # ========================================================
+    # DAY EXTREME ALERT
+    # ========================================================
+
+    def _on_day_extreme_alert(
+        self,
+        symbol: str,
+        alert: Dict[str, object],
+    ) -> None:
+
+        if not alert:
+            return
+
+        timestamp_value = alert.get("timestamp")
+
+        if isinstance(
+            timestamp_value,
+            datetime,
+        ):
+
+            if timestamp_value.tzinfo is None:
+
+                timestamp_value = timestamp_value.replace(tzinfo=IST)
+
+            timestamp = timestamp_value.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+        else:
+
+            timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+        pattern = alert.get(
+            "pattern",
+            "",
+        )
+
+        direction = alert.get(
+            "direction",
+            "",
+        )
+
+        confidence = alert.get(
+            "confidence",
+            0,
+        )
+
+        price = alert.get(
+            "price",
+            0,
+        )
+
+        # ----------------------------------------------------
+        # ACTUAL DAY EXTREME ALERT
+        # ----------------------------------------------------
+
+        print("")
+        print("=" * 60)
+        print("AIMIOS DAY EXTREME ALERT")
+        print("=" * 60)
+
+        print(f"TIME       : {timestamp}")
+
+        print(f"SYMBOL     : {symbol}")
+
+        print(f"PATTERN    : {pattern}")
+
+        print(f"DIRECTION  : {direction}")
+
+        print(f"CONFIDENCE : {confidence}%")
+
+        print(f"PRICE      : {price}")
+
+        print(f"DAY HIGH   : " f"{alert.get('day_high', '')}")
+
+        print(f"DAY LOW    : " f"{alert.get('day_low', '')}")
+
+        # ----------------------------------------------------
+        # M
+        # ----------------------------------------------------
+
+        if pattern == "M":
+
+            print(f"HIGH1      : " f"{alert.get('high1', '')}")
+
+            print(f"VALLEY     : " f"{alert.get('valley', '')}")
+
+            print(f"HIGH2      : " f"{alert.get('high2', '')}")
+
+        # ----------------------------------------------------
+        # W
+        # ----------------------------------------------------
+
+        if pattern == "W":
+
+            print(f"LOW1       : " f"{alert.get('low1', '')}")
+
+            print(f"PEAK       : " f"{alert.get('peak', '')}")
+
+            print(f"LOW2       : " f"{alert.get('low2', '')}")
+
+        print("=" * 60)
+        print("")
+
+        # ----------------------------------------------------
+        # CSV
+        # ----------------------------------------------------
+
+        self._append_day_extreme_log(
+            timestamp,
+            symbol,
+            alert,
+        )
+
+    # ========================================================
+    # DAY EXTREME CSV
+    # ========================================================
+
+    def _append_day_extreme_log(
+        self,
+        timestamp: str,
+        symbol: str,
+        alert: Dict[str, object],
+    ) -> None:
+
+        with self.day_extreme_log_path.open(
+            "a",
+            encoding="utf-8",
+            newline="",
+        ) as csv_file:
+
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=[
+                    "timestamp",
+                    "symbol",
+                    "pattern",
+                    "direction",
+                    "confidence",
+                    "price",
+                    "day_high",
+                    "day_low",
+                    "high1",
+                    "valley",
+                    "high2",
+                    "low1",
+                    "peak",
+                    "low2",
+                ],
+            )
+
+            writer.writerow(
+                {
+                    "timestamp": timestamp,
+                    "symbol": symbol,
+                    "pattern": alert.get(
+                        "pattern",
+                        "",
+                    ),
+                    "direction": alert.get(
+                        "direction",
+                        "",
+                    ),
+                    "confidence": alert.get(
+                        "confidence",
+                        0,
+                    ),
+                    "price": alert.get(
+                        "price",
+                        0,
+                    ),
+                    "day_high": alert.get(
+                        "day_high",
+                        0,
+                    ),
+                    "day_low": alert.get(
+                        "day_low",
+                        0,
+                    ),
+                    "high1": alert.get(
+                        "high1",
+                        "",
+                    ),
+                    "valley": alert.get(
+                        "valley",
+                        "",
+                    ),
+                    "high2": alert.get(
+                        "high2",
+                        "",
+                    ),
+                    "low1": alert.get(
+                        "low1",
+                        "",
+                    ),
+                    "peak": alert.get(
+                        "peak",
+                        "",
+                    ),
+                    "low2": alert.get(
+                        "low2",
+                        "",
+                    ),
+                }
+            )
 
     # ========================================================
     # RESOLVE INSTRUMENT
@@ -639,7 +1362,7 @@ class KiteLiveFeed:
             return instrument_id
 
         # ----------------------------------------------------
-        # FALLBACK MAPPING
+        # FALLBACK
         # ----------------------------------------------------
 
         fallback_map = {
@@ -661,10 +1384,6 @@ class KiteLiveFeed:
             )
 
             return instrument_id
-
-        # ----------------------------------------------------
-        # UNKNOWN TOKEN
-        # ----------------------------------------------------
 
         logger.warning(
             "Unknown Kite instrument token: %s",
@@ -739,6 +1458,12 @@ class KiteLiveFeed:
             previous_close=previous_close,
         )
 
+        # ----------------------------------------------------
+        # BROKER SYNC MESSAGE
+        #
+        # Disabled by default.
+        # ----------------------------------------------------
+
         if not self._broker_ohlc_seen.get(
             instrument_id,
             False,
@@ -746,22 +1471,24 @@ class KiteLiveFeed:
 
             self._broker_ohlc_seen[instrument_id] = True
 
-            print("")
-            print("[BROKER DAY OHLC SYNC]")
+            if ENABLE_BROKER_SYNC_PRINT:
 
-            print(f"{instrument_id}")
+                print("")
+                print("[BROKER DAY OHLC SYNC]")
 
-            print(f"Open     : {open_price}")
+                print(f"{instrument_id}")
 
-            print(f"Day High : {high_price}")
+                print(f"Open     : {open_price}")
 
-            print(f"Day Low  : {low_price}")
+                print(f"Day High : {high_price}")
 
-            print(f"PrevClose: {previous_close}")
+                print(f"Day Low  : {low_price}")
 
-            print("Broker day range synchronized.")
+                print(f"PrevClose: {previous_close}")
 
-            print("")
+                print("Broker day range synchronized.")
+
+                print("")
 
     # ========================================================
     # FIRST TICK
@@ -919,9 +1646,9 @@ class KiteLiveFeed:
 
             if value.tzinfo is None:
 
-                return value.replace(tzinfo=timezone.utc)
+                return value.replace(tzinfo=IST)
 
-            return value.astimezone(timezone.utc)
+            return value.astimezone(IST)
 
         if isinstance(
             value,
@@ -934,23 +1661,31 @@ class KiteLiveFeed:
 
                 if parsed.tzinfo is None:
 
-                    parsed = parsed.replace(tzinfo=timezone.utc)
+                    parsed = parsed.replace(tzinfo=IST)
 
-                return parsed.astimezone(timezone.utc)
+                return parsed.astimezone(IST)
 
             except ValueError:
 
                 pass
 
-        return datetime.now(timezone.utc)
+        return datetime.now(IST)
 
     # ========================================================
     # HEALTH
+    #
+    # Kept for optional diagnostics.
+    #
+    # ENABLE_HEALTH_PRINT = False means it is not called
+    # from the main live-feed loop.
     # ========================================================
 
     def _print_health(
         self,
     ) -> None:
+
+        if not ENABLE_HEALTH_PRINT:
+            return
 
         now = time.time()
 
@@ -967,9 +1702,10 @@ class KiteLiveFeed:
             last_tick = self._last_tick_time
 
         print("")
+
         print(
             "[AIMIOS HEALTH]",
-            datetime.now().strftime("%H:%M:%S"),
+            datetime.now(IST).strftime("%H:%M:%S"),
         )
 
         print(
@@ -979,7 +1715,7 @@ class KiteLiveFeed:
 
         if last_tick is not None:
 
-            age = (datetime.now(timezone.utc) - last_tick).total_seconds()
+            age = (datetime.now(IST) - last_tick).total_seconds()
 
             print(
                 "Last tick age:",
@@ -1025,7 +1761,7 @@ class KiteLiveFeed:
         print("")
 
     # ========================================================
-    # PATTERN ALERT
+    # EXISTING M/W PATTERN ALERT
     # ========================================================
 
     def _on_pattern_detected(
@@ -1034,7 +1770,7 @@ class KiteLiveFeed:
         pattern: Dict[str, object],
     ) -> None:
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
         print("")
         print("-" * 60)
@@ -1065,7 +1801,7 @@ class KiteLiveFeed:
         )
 
     # ========================================================
-    # PATTERN CSV
+    # EXISTING PATTERN CSV
     # ========================================================
 
     def _append_pattern_log(
