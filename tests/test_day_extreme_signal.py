@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from aimios.engines.day_extreme_pattern_sentinel import DayExtremePatternSentinel
 from app.kite_live_feed import KiteLiveFeed
 
@@ -165,3 +167,41 @@ def test_watch_status_only_prints_near_reversal() -> None:
     }
     status_far = feed._build_instrument_watch_status("NIFTY")
     assert status_far == "WATCH | NONE"
+
+
+def test_eod_signal_evaluation_scores_buy_and_sell_outcomes() -> None:
+    sentinel = DayExtremePatternSentinel()
+    symbol = "NIFTY"
+    day_key = "2026-09-01"
+
+    sentinel._signal_history[symbol] = [
+        {
+            "symbol": symbol,
+            "direction": "BUY",
+            "entry_price": 98.0,
+            "timestamp": datetime(2026, 9, 1, 9, 15, tzinfo=timezone.utc),
+            "confidence": 90.0,
+            "pattern": "W",
+            "day_key": day_key,
+        },
+        {
+            "symbol": symbol,
+            "direction": "SELL",
+            "entry_price": 105.0,
+            "timestamp": datetime(2026, 9, 1, 10, 15, tzinfo=timezone.utc),
+            "confidence": 88.0,
+            "pattern": "M",
+            "day_key": day_key,
+        },
+    ]
+
+    summary = sentinel.evaluate_eod_signal_quality(
+        symbol,
+        day_close_price=101.0,
+    )
+
+    assert summary["total_signals"] == 2
+    assert summary["buy_good"] == 1
+    assert summary["sell_good"] == 1
+    assert summary["win_rate"] == 100.0
+    assert summary["status"] == "GOOD"

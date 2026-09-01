@@ -274,6 +274,13 @@ class DayExtremePatternSentinel:
 
         self._signal_counts: Dict[str, Dict[str, int]] = {}
 
+        # ----------------------------------------------------
+        # EOD SIGNAL HISTORY AND SELF-LEARNING
+        # ----------------------------------------------------
+
+        self._signal_history: Dict[str, List[Dict[str, object]]] = {}
+        self._learning_state: Dict[str, Dict[str, float]] = {}
+
     # ========================================================
     # CLEAR
     # ========================================================
@@ -294,6 +301,8 @@ class DayExtremePatternSentinel:
         self._feel_good_buy_sent.clear()
         self._feel_good_sell_sent.clear()
         self._signal_counts.clear()
+        self._signal_history.clear()
+        self._learning_state.clear()
 
     # ========================================================
     # CLEAR SYMBOL
@@ -320,6 +329,8 @@ class DayExtremePatternSentinel:
         self._feel_good_buy_sent.pop(symbol, None)
         self._feel_good_sell_sent.pop(symbol, None)
         self._signal_counts.pop(symbol, None)
+        self._signal_history.pop(symbol, None)
+        self._learning_state.pop(symbol, None)
 
     # ========================================================
     # PROCESS CANDLE
@@ -781,7 +792,7 @@ class DayExtremePatternSentinel:
             ),
         )
 
-        self._register_signal(symbol, "SELL")
+        self._register_signal(symbol, "SELL", alert)
 
         print(
             f"M ALERT | "
@@ -1042,7 +1053,7 @@ class DayExtremePatternSentinel:
             ),
         )
 
-        self._register_signal(symbol, "BUY")
+        self._register_signal(symbol, "BUY", alert)
 
         print(
             f"W ALERT | "
@@ -1329,7 +1340,7 @@ class DayExtremePatternSentinel:
                 4,
             ),
         )
-        self._register_signal(symbol, "SELL")
+        self._register_signal(symbol, "SELL", alert)
         return alert
 
     # ========================================================
@@ -1598,7 +1609,7 @@ class DayExtremePatternSentinel:
                 4,
             ),
         )
-        self._register_signal(symbol, "BUY")
+        self._register_signal(symbol, "BUY", alert)
         return alert
 
     # ========================================================
@@ -2046,6 +2057,7 @@ class DayExtremePatternSentinel:
         self,
         symbol: str,
         direction: str,
+        alert: Optional[Dict[str, object]] = None,
     ) -> None:
 
         self._ensure_daily_signal_counter(
@@ -2062,10 +2074,24 @@ class DayExtremePatternSentinel:
 
         if normalized == "BUY":
             counts["buy"] = counts.get("buy", 0) + 1
-            return
-
-        if normalized == "SELL":
+        elif normalized == "SELL":
             counts["sell"] = counts.get("sell", 0) + 1
+
+        if alert is not None:
+            symbol_name = str(symbol)
+            self._signal_history.setdefault(symbol_name, []).append(
+                {
+                    "symbol": symbol_name,
+                    "direction": normalized,
+                    "entry_price": float(alert.get("entry", alert.get("price", 0.0))),
+                    "timestamp": alert.get("timestamp"),
+                    "confidence": float(alert.get("confidence", 0.0)),
+                    "pattern": alert.get("pattern", ""),
+                    "alert_type": alert.get("alert_type", ""),
+                    "logic": alert.get("logic", ""),
+                    "day_key": self._day_key.get(symbol_name, ""),
+                }
+            )
 
     # ========================================================
     # RESET DAY STATE
@@ -2209,3 +2235,144 @@ class DayExtremePatternSentinel:
             "max_buy_per_day": 1,
             "max_sell_per_day": 1,
         }
+
+    # ========================================================
+    # EOD SIGNAL QUALITY
+    # ========================================================
+
+    def evaluate_eod_signal_quality(
+        self,
+        symbol: str,
+        *,
+        day_close_price: Optional[float] = None,
+        day_key: Optional[str] = None,
+        apply_learning: bool = True,
+    ) -> Dict[str, object]:
+
+        symbol = str(symbol)
+        history = list(self._signal_history.get(symbol, []))
+
+        if day_key is not None:
+            history = [entry for entry in history if entry.get("day_key") == day_key]
+
+        if not history:
+            return {
+                "symbol": symbol,
+                "total_signals": 0,
+                "buy_count": 0,
+                "sell_count": 0,
+                "buy_good": 0,
+                "sell_good": 0,
+                "win_rate": 0.0,
+                "status": "NO_DATA",
+                "suggestion": "No signal history available for EOD review.",
+                "learning_adjusted": False,
+            }
+
+        if day_close_price is None:
+            day_close_price = 0.0
+
+        try:
+            close_price = float(day_close_price)
+        except TypeError, ValueError:
+            close_price = 0.0
+
+        buy_count = sum(1 for entry in history if entry.get("direction") == "BUY")
+        sell_count = sum(1 for entry in history if entry.get("direction") == "SELL")
+
+        buy_good = 0
+        sell_good = 0
+
+        for entry in history:
+            direction = str(entry.get("direction", "")).upper()
+            entry_price = float(entry.get("entry_price", 0.0))
+
+            if direction == "BUY":
+                if close_price >= entry_price:
+                    buy_good += 1
+            elif direction == "SELL":
+                if close_price <= entry_price:
+                    sell_good += 1
+
+        total_good = buy_good + sell_good
+        total_signals = len(history)
+        win_rate = (total_good / total_signals) * 100.0 if total_signals else 0.0
+
+        if win_rate >= 60.0:
+            status = "GOOD"
+        elif win_rate >= 40.0:
+            status = "MIXED"
+        else:
+            status = "BAD"
+
+        suggestions: List[str] = []
+        if buy_count and buy_good < buy_count:
+            suggestions.append(
+                "Buy logic is weak: tighten the buy confidence gate or wait for stronger low-side reversals."
+            )
+        if sell_count and sell_good < sell_count:
+            suggestions.append(
+                "Sell logic is weak: tighten the sell confidence gate or wait for stronger high-side reversals."
+            )
+        if not suggestions:
+            suggestions.append(
+                "Strategy is aligned with the day move; keep the current signal logic."
+            )
+
+        result = {
+            "symbol": symbol,
+            "total_signals": total_signals,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "buy_good": buy_good,
+            "sell_good": sell_good,
+            "win_rate": round(win_rate, 2),
+            "status": status,
+            "suggestion": " ".join(suggestions),
+            "learning_adjusted": False,
+        }
+
+        if apply_learning:
+            result["learning_adjusted"] = self._apply_learning_from_eod(symbol, result)
+
+        return result
+
+    def _apply_learning_from_eod(
+        self,
+        symbol: str,
+        summary: Dict[str, object],
+    ) -> bool:
+
+        symbol = str(symbol)
+        win_rate = float(summary.get("win_rate", 0.0))
+        status = str(summary.get("status", "NO_DATA")).upper()
+
+        state = self._learning_state.setdefault(
+            symbol,
+            {
+                "confidence_floor": float(self.min_signal_confidence),
+                "buy_bias": 1.0,
+                "sell_bias": 1.0,
+            },
+        )
+
+        if status == "BAD":
+            state["confidence_floor"] = min(95.0, state["confidence_floor"] + 5.0)
+            state["buy_bias"] = max(0.5, state["buy_bias"] * 0.8)
+            state["sell_bias"] = max(0.5, state["sell_bias"] * 0.8)
+            self.min_signal_confidence = float(state["confidence_floor"])
+            return True
+
+        if status == "GOOD":
+            state["confidence_floor"] = max(80.0, state["confidence_floor"] - 2.0)
+            state["buy_bias"] = min(1.2, state["buy_bias"] * 1.05)
+            state["sell_bias"] = min(1.2, state["sell_bias"] * 1.05)
+            self.min_signal_confidence = float(state["confidence_floor"])
+            return True
+
+        if win_rate >= 50.0:
+            state["confidence_floor"] = max(80.0, state["confidence_floor"] - 1.0)
+            self.min_signal_confidence = float(state["confidence_floor"])
+            return True
+
+        return False
