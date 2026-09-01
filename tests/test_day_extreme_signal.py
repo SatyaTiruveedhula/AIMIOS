@@ -205,3 +205,80 @@ def test_eod_signal_evaluation_scores_buy_and_sell_outcomes() -> None:
     assert summary["sell_good"] == 1
     assert summary["win_rate"] == 100.0
     assert summary["status"] == "GOOD"
+
+
+def test_runtime_state_can_be_saved_and_restored_for_restart_recovery(tmp_path) -> None:
+    feed = object.__new__(KiteLiveFeed)
+    feed.instrument_ids = ["NIFTY"]
+    feed.day_extreme_sentinel = DayExtremePatternSentinel()
+    feed._last_snapshots = {
+        "NIFTY": type(
+            "Snapshot",
+            (),
+            {
+                "symbol": "NIFTY",
+                "ltp": 101.25,
+                "open": 100.0,
+                "high": 102.0,
+                "low": 99.5,
+                "close": 101.25,
+                "volume": 5000,
+                "timestamp": datetime(2026, 9, 1, 9, 30, tzinfo=timezone.utc),
+                "market_status": "OPEN",
+                "session": "regular",
+            },
+        )()
+    }
+    feed.day_extreme_sentinel._m_setup["NIFTY"] = type(
+        "Setup",
+        (),
+        {
+            "high1": 102.0,
+            "high1_timestamp": datetime(2026, 9, 1, 9, 20, tzinfo=timezone.utc),
+            "high1_candle_id": 12,
+            "valley": 100.0,
+            "valley_timestamp": datetime(2026, 9, 1, 9, 25, tzinfo=timezone.utc),
+            "valley_candle_id": 13,
+            "waiting_printed": True,
+            "active": True,
+        },
+    )()
+
+    save_path = tmp_path / "runtime_state.json"
+    feed._runtime_state_path = lambda: save_path
+
+    feed._save_runtime_state()
+
+    restored = object.__new__(KiteLiveFeed)
+    restored.instrument_ids = ["NIFTY"]
+    restored.day_extreme_sentinel = DayExtremePatternSentinel()
+    restored._last_snapshots = {}
+    restored._runtime_state_path = lambda: save_path
+
+    restored._restore_runtime_state()
+
+    assert restored._last_snapshots["NIFTY"].ltp == 101.25
+    assert restored.day_extreme_sentinel.get_m_setup("NIFTY")["high1"] == 102.0
+    assert restored.day_extreme_sentinel.get_m_setup("NIFTY")["valley"] == 100.0
+
+
+def test_signal_cooling_alert_emits_once_per_cycle(capsys) -> None:
+    feed = object.__new__(KiteLiveFeed)
+    feed.day_extreme_sentinel = DayExtremePatternSentinel()
+    feed._last_snapshots = {
+        "NIFTY": type(
+            "Snapshot",
+            (),
+            {"ltp": 101.0},
+        )()
+    }
+    feed._last_signal_direction = {"NIFTY": "BUY"}
+    feed._signal_cooling_notified = {}
+
+    feed._maybe_emit_cooled_signal_alert("NIFTY")
+    first = capsys.readouterr().out
+    assert "BUY SIGNAL COOLED" in first
+
+    feed._maybe_emit_cooled_signal_alert("NIFTY")
+    second = capsys.readouterr().out
+    assert "BUY SIGNAL COOLED" not in second

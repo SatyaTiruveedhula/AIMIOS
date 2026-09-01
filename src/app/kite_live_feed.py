@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import signal
 import time
@@ -209,6 +210,20 @@ class KiteLiveFeed:
 
         self._last_15min_snapshot_epoch = 0.0
 
+        self._runtime_state_path = PROJECT_ROOT / "logs" / "runtime_state.json"
+
+        self._reconnect_attempts = 0
+
+        self._max_reconnect_delay = 30
+
+        self._last_signal_direction: Dict[str, str] = {}
+
+        self._signal_cooling_notified: Dict[str, str] = {}
+
+        self._reconnect_attempts = 0
+
+        self._max_reconnect_delay = 30
+
         # ====================================================
         # BROKER DAY OHLC
         # ====================================================
@@ -346,30 +361,253 @@ class KiteLiveFeed:
 
             writer.writeheader()
 
+    def _get_runtime_state_path(self):
+        path = self._runtime_state_path
+        if callable(path):
+            path = path()
+        return Path(str(path))
+
+    def _save_runtime_state(self) -> None:
+        state_path = self._get_runtime_state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "instrument_ids": list(self.instrument_ids),
+            "snapshots": [],
+            "m_setup": [],
+            "w_setup": [],
+            "day_extremes": {},
+        }
+
+        for instrument_id, snapshot in self._last_snapshots.items():
+            payload["snapshots"].append(
+                {
+                    "symbol": instrument_id,
+                    "ltp": float(snapshot.ltp),
+                    "open": float(snapshot.open),
+                    "high": float(snapshot.high),
+                    "low": float(snapshot.low),
+                    "close": float(snapshot.close),
+                    "volume": float(snapshot.volume),
+                    "timestamp": snapshot.timestamp.isoformat(),
+                    "market_status": (
+                        snapshot.market_status.value
+                        if hasattr(snapshot.market_status, "value")
+                        else str(snapshot.market_status)
+                    ),
+                    "session": getattr(snapshot, "session", "regular"),
+                }
+            )
+
+        if self.day_extreme_sentinel is not None:
+            for symbol, setup in getattr(
+                self.day_extreme_sentinel, "_m_setup", {}
+            ).items():
+                payload["m_setup"].append(
+                    {
+                        "symbol": symbol,
+                        "high1": float(setup.high1),
+                        "high1_timestamp": (
+                            setup.high1_timestamp.isoformat()
+                            if getattr(setup, "high1_timestamp", None) is not None
+                            else None
+                        ),
+                        "high1_candle_id": int(getattr(setup, "high1_candle_id", 0)),
+                        "valley": (
+                            float(setup.valley)
+                            if getattr(setup, "valley", None) is not None
+                            else None
+                        ),
+                        "valley_timestamp": (
+                            setup.valley_timestamp.isoformat()
+                            if getattr(setup, "valley_timestamp", None) is not None
+                            else None
+                        ),
+                        "valley_candle_id": getattr(setup, "valley_candle_id", None),
+                        "waiting_printed": bool(
+                            getattr(setup, "waiting_printed", False)
+                        ),
+                        "active": bool(getattr(setup, "active", True)),
+                    }
+                )
+
+            for symbol, setup in getattr(
+                self.day_extreme_sentinel, "_w_setup", {}
+            ).items():
+                payload["w_setup"].append(
+                    {
+                        "symbol": symbol,
+                        "low1": float(setup.low1),
+                        "low1_timestamp": (
+                            setup.low1_timestamp.isoformat()
+                            if getattr(setup, "low1_timestamp", None) is not None
+                            else None
+                        ),
+                        "low1_candle_id": int(getattr(setup, "low1_candle_id", 0)),
+                        "peak": (
+                            float(setup.peak)
+                            if getattr(setup, "peak", None) is not None
+                            else None
+                        ),
+                        "peak_timestamp": (
+                            setup.peak_timestamp.isoformat()
+                            if getattr(setup, "peak_timestamp", None) is not None
+                            else None
+                        ),
+                        "peak_candle_id": getattr(setup, "peak_candle_id", None),
+                        "waiting_printed": bool(
+                            getattr(setup, "waiting_printed", False)
+                        ),
+                        "active": bool(getattr(setup, "active", True)),
+                    }
+                )
+
+            payload["day_extremes"] = {
+                "day_high": {
+                    str(symbol): float(value)
+                    for symbol, value in getattr(
+                        self.day_extreme_sentinel, "_last_day_high", {}
+                    ).items()
+                },
+                "day_low": {
+                    str(symbol): float(value)
+                    for symbol, value in getattr(
+                        self.day_extreme_sentinel, "_last_day_low", {}
+                    ).items()
+                },
+            }
+
+        with state_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+
+    def _restore_runtime_state(self) -> None:
+        state_path = self._get_runtime_state_path()
+        if not state_path.exists():
+            return
+
+        try:
+            with state_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except json.JSONDecodeError, OSError:
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        for item in payload.get("snapshots", []):
+            symbol = str(item.get("symbol", ""))
+            if not symbol:
+                continue
+            snapshot = MarketSnapshot(
+                symbol=symbol,
+                ltp=float(item.get("ltp", 0.0)),
+                open=float(item.get("open", item.get("ltp", 0.0))),
+                high=float(item.get("high", item.get("ltp", 0.0))),
+                low=float(item.get("low", item.get("ltp", 0.0))),
+                close=float(item.get("close", item.get("ltp", 0.0))),
+                volume=float(item.get("volume", 0.0)),
+                timestamp=(
+                    datetime.fromisoformat(item["timestamp"])
+                    if item.get("timestamp")
+                    else datetime.now(IST)
+                ),
+                market_status=(
+                    MarketStatus(item.get("market_status"))
+                    if item.get("market_status")
+                    in {status.value for status in MarketStatus}
+                    else MarketStatus.OPEN
+                ),
+                session=item.get("session", "regular"),
+            )
+            self._last_snapshots[symbol] = snapshot
+
+        if self.day_extreme_sentinel is not None:
+            for item in payload.get("m_setup", []):
+                symbol = str(item.get("symbol", ""))
+                if not symbol:
+                    continue
+                setup_type = type(
+                    "RestoredMSetup",
+                    (),
+                    {
+                        "high1": float(item.get("high1", 0.0)),
+                        "high1_timestamp": (
+                            datetime.fromisoformat(item["high1_timestamp"])
+                            if item.get("high1_timestamp")
+                            else datetime.now(IST)
+                        ),
+                        "high1_candle_id": int(item.get("high1_candle_id", 0)),
+                        "valley": (
+                            float(item["valley"])
+                            if item.get("valley") is not None
+                            else None
+                        ),
+                        "valley_timestamp": (
+                            datetime.fromisoformat(item["valley_timestamp"])
+                            if item.get("valley_timestamp")
+                            else None
+                        ),
+                        "valley_candle_id": item.get("valley_candle_id"),
+                        "waiting_printed": bool(item.get("waiting_printed", False)),
+                        "active": bool(item.get("active", True)),
+                    },
+                )
+                self.day_extreme_sentinel._m_setup[symbol] = setup_type()
+
+            for item in payload.get("w_setup", []):
+                symbol = str(item.get("symbol", ""))
+                if not symbol:
+                    continue
+                setup_type = type(
+                    "RestoredWSetup",
+                    (),
+                    {
+                        "low1": float(item.get("low1", 0.0)),
+                        "low1_timestamp": (
+                            datetime.fromisoformat(item["low1_timestamp"])
+                            if item.get("low1_timestamp")
+                            else datetime.now(IST)
+                        ),
+                        "low1_candle_id": int(item.get("low1_candle_id", 0)),
+                        "peak": (
+                            float(item["peak"])
+                            if item.get("peak") is not None
+                            else None
+                        ),
+                        "peak_timestamp": (
+                            datetime.fromisoformat(item["peak_timestamp"])
+                            if item.get("peak_timestamp")
+                            else None
+                        ),
+                        "peak_candle_id": item.get("peak_candle_id"),
+                        "waiting_printed": bool(item.get("waiting_printed", False)),
+                        "active": bool(item.get("active", True)),
+                    },
+                )
+                self.day_extreme_sentinel._w_setup[symbol] = setup_type()
+
+            for symbol, value in (
+                payload.get("day_extremes", {}).get("day_high", {}).items()
+            ):
+                self.day_extreme_sentinel._last_day_high[str(symbol)] = float(value)
+            for symbol, value in (
+                payload.get("day_extremes", {}).get("day_low", {}).items()
+            ):
+                self.day_extreme_sentinel._last_day_low[str(symbol)] = float(value)
+
     # ========================================================
     # START
     # ========================================================
 
-    def start(
-        self,
-    ) -> None:
+    def _connect_kite_ticker(self) -> None:
 
         if KiteTicker is None:
-
             raise RuntimeError("kiteconnect is not installed")
-
-        self._stop_event.clear()
-
-        self._ready.clear()
 
         print("")
         print("=" * 60)
         print("AIMIOS LIVE FEED STARTING")
         print("=" * 60)
-
-        # ----------------------------------------------------
-        # BROKER
-        # ----------------------------------------------------
 
         print("Connecting to Kite broker...")
 
@@ -378,22 +616,13 @@ class KiteLiveFeed:
         self._broker.login()
 
         if not self._broker.logged_in:
-
-            print("No cached Kite session found; " "generating session...")
-
+            print("No cached Kite session found; generating session...")
             self._broker.generate_session()
-
         else:
-
             print("Cached Kite session detected.")
 
         if self._broker.client is None or self._broker.access_token is None:
-
-            raise RuntimeError("Kite broker did not provide " "a valid access token")
-
-        # ----------------------------------------------------
-        # KITE TICKER
-        # ----------------------------------------------------
+            raise RuntimeError("Kite broker did not provide a valid access token")
 
         self._ticker = KiteTicker(
             self._broker.api_key,
@@ -401,44 +630,20 @@ class KiteLiveFeed:
         )
 
         self._ticker.on_ticks = self._on_ticks
-
         self._ticker.on_connect = self._on_connect
-
         self._ticker.on_close = self._on_close
-
         self._ticker.on_error = self._on_error
-
-        # ----------------------------------------------------
-        # TOKENS
-        # ----------------------------------------------------
 
         self._resolve_subscription_tokens()
 
-        print(
-            "Subscription symbols:",
-            self._subscription_symbols,
-        )
-
-        print(
-            "Subscription tokens:",
-            self._subscription_tokens,
-        )
-
-        print(
-            "Token mapping:",
-            self._instrument_id_by_token,
-        )
-
-        # ----------------------------------------------------
-        # CONNECT
-        # ----------------------------------------------------
+        print("Subscription symbols:", self._subscription_symbols)
+        print("Subscription tokens:", self._subscription_tokens)
+        print("Token mapping:", self._instrument_id_by_token)
 
         self._ticker.connect(threaded=True)
 
         if not self._ready.wait(timeout=30):
-
-            self._stop_event.set()
-
+            self._ticker = None
             raise RuntimeError("KiteTicker did not become ready")
 
         print("")
@@ -454,22 +659,38 @@ class KiteLiveFeed:
         print("=" * 60)
         print("")
 
-        # ----------------------------------------------------
-        # MAIN WAIT LOOP
-        #
-        # IMPORTANT:
-        #
-        # Previously this loop called _print_health()
-        # every 5 seconds.
-        #
-        # That caused the repeated output the user was seeing.
-        #
-        # We now simply wait for the feed to stop.
-        # ----------------------------------------------------
+    def start(
+        self,
+    ) -> None:
 
-        while not self._stop_event.wait(timeout=1):
+        self._stop_event.clear()
+        self._ready.clear()
+        self._restore_runtime_state()
 
-            pass
+        reconnect_delay = 5
+
+        while not self._stop_event.is_set():
+            try:
+                self._connect_kite_ticker()
+                self._reconnect_attempts = 0
+                reconnect_delay = 5
+
+                while not self._stop_event.wait(timeout=1):
+                    if not self._ready.is_set():
+                        break
+            except Exception:
+                logger.exception("Kite live feed connection failed")
+
+            if self._stop_event.is_set():
+                break
+
+            self._reconnect_attempts += 1
+            reconnect_delay = min(
+                5 * self._reconnect_attempts, self._max_reconnect_delay
+            )
+            print(f"Kite connection lost. Reconnecting in {reconnect_delay}s...")
+            self._ready.clear()
+            self._stop_event.wait(timeout=reconnect_delay)
 
         print("")
         print("Live feed loop exited.")
@@ -689,6 +910,14 @@ class KiteLiveFeed:
 
         try:
 
+            self._save_runtime_state()
+
+        except Exception:
+
+            logger.exception("Failed to save runtime state")
+
+        try:
+
             self._broker.disconnect()
 
         except Exception:
@@ -855,6 +1084,12 @@ class KiteLiveFeed:
 
         self._ready.clear()
 
+        if not self._stop_event.is_set():
+            self._ticker = None
+
+        if not self._stop_event.is_set():
+            self._ticker = None
+
     # ========================================================
     # TICKS
     # ========================================================
@@ -939,6 +1174,7 @@ class KiteLiveFeed:
 
                 self._last_prices[instrument_id] = snapshot.ltp
                 self._last_snapshots[instrument_id] = snapshot
+                self._save_runtime_state()
                 self._maybe_print_snapshots()
 
                 # --------------------------------------------
@@ -1144,12 +1380,54 @@ class KiteLiveFeed:
                     alert,
                 )
 
+            self._maybe_emit_cooled_signal_alert(instrument_id)
+
         except Exception:
 
             logger.exception(
                 "Day extreme processing failed for %s",
                 instrument_id,
             )
+
+    def _maybe_emit_cooled_signal_alert(
+        self,
+        symbol: str,
+    ) -> None:
+
+        direction = self._last_signal_direction.get(symbol)
+
+        if not direction:
+            return
+
+        direction = direction.upper()
+
+        if direction == "BUY":
+            has_active_setup = self.day_extreme_sentinel.get_w_setup(symbol) is not None
+        elif direction == "SELL":
+            has_active_setup = self.day_extreme_sentinel.get_m_setup(symbol) is not None
+        else:
+            has_active_setup = False
+
+        if has_active_setup:
+            return
+
+        if self._signal_cooling_notified.get(symbol) == direction:
+            return
+
+        snapshot = self._last_snapshots.get(symbol)
+        price = snapshot.ltp if snapshot is not None else 0.0
+
+        print("")
+        print("=" * 60)
+        print(f"{direction} SIGNAL COOLED")
+        print(f"SYMBOL     : {symbol}")
+        print(f"PRICE      : {price}")
+        print("STATUS     : setup lost strength; waiting for a fresh signal")
+        print("=" * 60)
+        print("")
+
+        self._signal_cooling_notified[symbol] = direction
+        self._last_signal_direction.pop(symbol, None)
 
     # ========================================================
     # DAY EXTREME ALERT
@@ -1252,6 +1530,9 @@ class KiteLiveFeed:
 
         print("=" * 60)
         print("")
+
+        self._last_signal_direction[symbol] = str(direction).upper()
+        self._signal_cooling_notified.pop(symbol, None)
 
         # ----------------------------------------------------
         # CSV
