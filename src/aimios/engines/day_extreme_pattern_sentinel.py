@@ -634,6 +634,13 @@ class DayExtremePatternSentinel:
 
         if setup.valley is None:
 
+            current_close = float(getattr(candle, "close", candle_high))
+            if current_close > 0:
+                gap_pct = abs(current_close - setup.high1) / setup.high1 * 100.0
+                if gap_pct > self.min_second_swing_difference_pct * 5.0:
+                    self._m_setup.pop(symbol, None)
+                    return None
+
             fall_pct = ((setup.high1 - candle_low) / setup.high1) * 100.0
 
             if fall_pct >= self.min_reversal_pct:
@@ -895,6 +902,13 @@ class DayExtremePatternSentinel:
         # ====================================================
 
         if setup.peak is None:
+
+            current_close = float(getattr(candle, "close", candle_low))
+            if current_close > 0:
+                gap_pct = abs(current_close - setup.low1) / setup.low1 * 100.0
+                if gap_pct > self.min_second_swing_difference_pct * 5.0:
+                    self._w_setup.pop(symbol, None)
+                    return None
 
             rise_pct = ((candle_high - setup.low1) / setup.low1) * 100.0
 
