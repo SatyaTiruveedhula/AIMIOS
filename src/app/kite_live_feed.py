@@ -556,7 +556,7 @@ class KiteLiveFeed:
                     "WAITING FOR SELL REVERSAL"
                 )
 
-        if buy_setup:
+        if buy_setup and not sell_setup:
             low1 = buy_setup.get("low1")
             peak = buy_setup.get("peak")
             if (
