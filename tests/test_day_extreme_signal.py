@@ -7,8 +7,8 @@ from app.kite_live_feed import KiteLiveFeed
 def test_day_extreme_signal_defaults_match_user_requirements() -> None:
     sentinel = DayExtremePatternSentinel()
 
-    assert sentinel.min_reversal_pct == 0.11
-    assert sentinel.min_second_swing_difference_pct == 0.05
+    assert sentinel.min_reversal_pct == 0.13
+    assert sentinel.min_second_swing_difference_pct == 0.04
     assert sentinel.min_candles_between_extremes == 5
     assert sentinel.max_buy_per_day == 2
     assert sentinel.max_sell_per_day == 2

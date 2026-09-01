@@ -18,18 +18,14 @@ logger = logging.getLogger(__name__)
 
 # HIGH1 -> VALLEY
 # LOW1  -> PEAK
-MIN_REVERSAL_PCT = 0.09
+MIN_REVERSAL_PCT = 0.13
 
 # HIGH1 -> HIGH2
 # LOW1  -> LOW2
-MIN_SECOND_SWING_DIFFERENCE_PCT = 0.05
+MIN_SECOND_SWING_DIFFERENCE_PCT = 0.04
 
 # Minimum candles from first outer point to second outer point.
-#
-# IMPORTANT:
-# This is now 4 candles.
-# NOT 7.
-MIN_CANDLES_BETWEEN_EXTREMES = 4
+MIN_CANDLES_BETWEEN_EXTREMES = 5
 
 
 # ============================================================
@@ -202,8 +198,8 @@ class DayExtremePatternSentinel:
 
     def __init__(
         self,
-        min_reversal_pct: float = 0.11,
-        min_second_swing_difference_pct: float = 0.05,
+        min_reversal_pct: float = 0.13,
+        min_second_swing_difference_pct: float = 0.04,
         min_candles_between_extremes: int = 5,
         max_buy_per_day: int = 2,
         max_sell_per_day: int = 2,
