@@ -748,7 +748,7 @@ class DayExtremePatternSentinel:
         if self._last_m_alert_candle.get(symbol) == candle_id:
             return None
 
-        if not self._can_emit_signal(symbol, "SELL"):
+        if not self._can_emit_signal(symbol, "SELL", candle_id):
             return None
 
         self._last_m_alert_candle[symbol] = candle_id
@@ -1016,7 +1016,7 @@ class DayExtremePatternSentinel:
         if self._last_w_alert_candle.get(symbol) == candle_id:
             return None
 
-        if not self._can_emit_signal(symbol, "BUY"):
+        if not self._can_emit_signal(symbol, "BUY", candle_id):
             return None
 
         self._last_w_alert_candle[symbol] = candle_id
@@ -1316,7 +1316,7 @@ class DayExtremePatternSentinel:
         if score < FEEL_GOOD_MIN_SCORE:
             return None
 
-        if not self._can_emit_signal(symbol, "SELL"):
+        if not self._can_emit_signal(symbol, "SELL", current_id):
             return None
 
         if not self._passes_confidence_gate(score):
@@ -1585,7 +1585,7 @@ class DayExtremePatternSentinel:
         if score < FEEL_GOOD_MIN_SCORE:
             return None
 
-        if not self._can_emit_signal(symbol, "BUY"):
+        if not self._can_emit_signal(symbol, "BUY", current_id):
             return None
 
         if not self._passes_confidence_gate(score):
@@ -2045,6 +2045,7 @@ class DayExtremePatternSentinel:
         self,
         symbol: str,
         direction: str,
+        candle_id: Optional[int] = None,
     ) -> bool:
 
         self._ensure_daily_signal_counter(
@@ -2055,11 +2056,45 @@ class DayExtremePatternSentinel:
         counts = self._signal_counts.get(symbol, {"buy": 0, "sell": 0})
         normalized = direction.upper()
 
+        # Basic daily cap check
         if normalized == "BUY":
-            return counts.get("buy", 0) < self.max_buy_per_day
+            if counts.get("buy", 0) >= self.max_buy_per_day:
+                return False
 
-        if normalized == "SELL":
-            return counts.get("sell", 0) < self.max_sell_per_day
+            next_index = counts.get("buy", 0) + 1
+            last_candle = self._last_w_alert_candle.get(symbol)
+
+        elif normalized == "SELL":
+            if counts.get("sell", 0) >= self.max_sell_per_day:
+                return False
+
+            next_index = counts.get("sell", 0) + 1
+            last_candle = self._last_m_alert_candle.get(symbol)
+
+        else:
+            return True
+
+        # Enforce escalating minimum spacing between successive alerts of the same type.
+        # Behavior:
+        #  - 2nd alert: min_gap = 2 * base
+        #  - 3rd alert: min_gap = 2 * 2 * base
+        #  - 4th alert: min_gap = 2 * 2 * 2 * base
+        # i.e. multiplier = 2 ** (next_index - 1)
+        if last_candle is not None and candle_id is not None and next_index > 1:
+            base = int(self.min_candles_between_extremes)
+            required_gap = base * (2 ** (next_index - 1))
+            actual_gap = int(candle_id) - int(last_candle)
+
+            if actual_gap < required_gap:
+                logger.debug(
+                    "Blocked %s signal for %s: need gap %d, have %d (next_index=%d)",
+                    normalized,
+                    symbol,
+                    required_gap,
+                    actual_gap,
+                    next_index,
+                )
+                return False
 
         return True
 
