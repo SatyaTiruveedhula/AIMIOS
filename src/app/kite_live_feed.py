@@ -48,6 +48,8 @@ IST = ZoneInfo("Asia/Kolkata")
 # ============================================================
 
 DEFAULT_INSTRUMENT_IDS = [
+    "NIFTY",
+    "BANKNIFTY",
     "SENSEX",
 ]
 
@@ -91,7 +93,7 @@ class KiteLiveFeed:
 
     @staticmethod
     def _is_active_alert_symbol(symbol: Optional[str]) -> bool:
-        return str(symbol or "").upper() == "SENSEX"
+        return str(symbol or "").upper() in {"NIFTY", "BANKNIFTY", "SENSEX"}
 
     def __init__(
         self,
@@ -102,7 +104,7 @@ class KiteLiveFeed:
         requested = instrument_ids or DEFAULT_INSTRUMENT_IDS
         self.instrument_ids = [
             symbol for symbol in requested if self._is_active_alert_symbol(symbol)
-        ] or ["SENSEX"]
+        ] or ["NIFTY", "BANKNIFTY", "SENSEX"]
 
         # ====================================================
         # BROKER

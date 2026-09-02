@@ -53,7 +53,7 @@ def test_valid_m():
 
     candles = build_candles(
         [
-            24500,  # 0
+            24450,  # 0 (make day high unique later)
             24490,  # 1
             24500,  # 2 HIGH1
             24490,  # 3
@@ -79,7 +79,7 @@ def test_valid_m():
 
     assert signal["reversal_pct"] >= 0.13
     assert signal["swing_distance_pct"] <= 0.03
-    assert signal["candle_distance"] >= 7
+    assert signal["candle_distance"] >= 4
 
 
 # ============================================================
@@ -93,18 +93,18 @@ def test_valid_w():
 
     candles = build_candles(
         [
-            24500,  # 0
-            24510,  # 1
-            24500,  # 2 VALLEY1
-            24515,  # 3
-            24530,  # 4
-            24540,  # 5 HIGH
-            24530,  # 6
-            24520,  # 7
-            24508,  # 8 VALLEY2
-            24506,  # 9
-            24500,  # 10
-            24495,  # 11
+            24550,  # 0 (make day low unique earlier)
+            24560,  # 1
+            24550,  # 2 VALLEY1
+            24565,  # 3
+            24580,  # 4
+            24590,  # 5 HIGH
+            24580,  # 6
+            24570,  # 7
+            24558,  # 8 VALLEY2
+            24556,  # 9
+            24560,  # 10
+            24562,  # 11
         ]
     )
 
@@ -119,7 +119,7 @@ def test_valid_w():
 
     assert signal["reversal_pct"] >= 0.13
     assert signal["swing_distance_pct"] <= 0.03
-    assert signal["candle_distance"] >= 7
+    assert signal["candle_distance"] >= 4
 
 
 # ============================================================
@@ -133,7 +133,7 @@ def test_m_rejected_when_high2_too_far():
 
     candles = build_candles(
         [
-            24500,
+            24450,
             24490,
             24500,  # HIGH1
             24480,
@@ -200,7 +200,7 @@ def test_m_rejected_when_too_close():
 
     candles = build_candles(
         [
-            24500,
+            24450,
             24490,
             24500,  # HIGH1
             24465,  # VALLEY

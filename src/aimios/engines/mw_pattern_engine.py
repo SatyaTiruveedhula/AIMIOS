@@ -18,14 +18,15 @@ MIN_REVERSAL_PCT = 0.13
 
 # M:
 # HIGH1 must be higher than HIGH2 by at least 0.03%.
-MIN_HIGH1_HIGH2_DIFFERENCE_PCT = 0.03
+MAX_HIGH1_HIGH2_DIFFERENCE_PCT = 0.03
 
 # W:
 # VALLEY1 and VALLEY2 must be within 0.03%.
 MAX_OUTER_DIFFERENCE_PCT = 0.03
 
 # Minimum distance between the two outer points.
-MIN_PIVOT_DISTANCE = 7
+# Reduced per user request to allow alerts when pivots are at least 4 candles apart.
+MIN_PIVOT_DISTANCE = 4
 
 # Indian market timezone.
 INDIA_TZ = ZoneInfo("Asia/Kolkata")
@@ -185,7 +186,7 @@ class MWPatternEngine:
         self,
         min_reversal_pct: float = MIN_REVERSAL_PCT,
         max_outer_difference_pct: float = MAX_OUTER_DIFFERENCE_PCT,
-        min_high1_high2_difference_pct: float = MIN_HIGH1_HIGH2_DIFFERENCE_PCT,
+        max_high1_high2_difference_pct: float = MAX_HIGH1_HIGH2_DIFFERENCE_PCT,
         min_pivot_distance: int = MIN_PIVOT_DISTANCE,
     ) -> None:
 
@@ -193,7 +194,7 @@ class MWPatternEngine:
 
         self.max_outer_difference_pct = float(max_outer_difference_pct)
 
-        self.min_high1_high2_difference_pct = float(min_high1_high2_difference_pct)
+        self.max_high1_high2_difference_pct = float(max_high1_high2_difference_pct)
 
         self.min_pivot_distance = int(min_pivot_distance)
 
@@ -448,7 +449,9 @@ class MWPatternEngine:
 
             swing_distance_pct = (day_high - high2_value) / abs(day_high) * 100.0
 
-            if swing_distance_pct < self.min_high1_high2_difference_pct:
+            # Require HIGH2 to rebound up to within a small tolerance of HIGH1.
+            # i.e., HIGH1 and HIGH2 must be close (<= max_high1_high2_difference_pct)
+            if swing_distance_pct > self.max_high1_high2_difference_pct:
                 continue
 
             # ------------------------------------------------

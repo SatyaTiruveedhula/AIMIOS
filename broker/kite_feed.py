@@ -406,8 +406,7 @@ class KiteFeed(BrokerBase):
     def _start_callback_listener(self) -> None:
         if self.callback_server is not None:
             return
-
-        host = "127.0.0.1"
+        host = getattr(self, "callback_host", "127.0.0.1")
         server_address = (host, self.callback_port)
         self.callback_server = HTTPServer(server_address, RequestTokenHandler)
         self.callback_server.request_token = None
@@ -419,9 +418,10 @@ class KiteFeed(BrokerBase):
         )
         self.server_thread.start()
         logger.info(
-            "Started callback server on http://%s:%s/callback",
+            "Started callback server on http://%s:%s%s",
             host,
             self.callback_port,
+            self.callback_path,
         )
 
     def _stop_callback_listener(self) -> None:
