@@ -24,6 +24,7 @@ from aimios.market.market_snapshot import (
 from aimios.engines.day_extreme_pattern_sentinel import (
     DayExtremePatternSentinel,
 )
+from aimios.engines.h1v1h2h3 import H1V1H2H3Detector
 
 try:
     from kiteconnect import KiteTicker
@@ -48,8 +49,6 @@ IST = ZoneInfo("Asia/Kolkata")
 # ============================================================
 
 DEFAULT_INSTRUMENT_IDS = [
-    "NIFTY",
-    "BANKNIFTY",
     "SENSEX",
 ]
 
@@ -93,7 +92,7 @@ class KiteLiveFeed:
 
     @staticmethod
     def _is_active_alert_symbol(symbol: Optional[str]) -> bool:
-        return str(symbol or "").upper() in {"NIFTY", "BANKNIFTY", "SENSEX"}
+        return str(symbol or "").upper() == "SENSEX"
 
     def __init__(
         self,
@@ -131,6 +130,12 @@ class KiteLiveFeed:
         # ====================================================
 
         self.day_extreme_sentinel = DayExtremePatternSentinel()
+
+        # ====================================================
+        # H1V1H2H3 UNDIRECTIONAL ALERTS
+        # ====================================================
+
+        self.h1v1h2h3_detector = H1V1H2H3Detector()
 
         # ====================================================
         # THREAD / CONTROL
@@ -1384,6 +1389,14 @@ class KiteLiveFeed:
                     alert,
                 )
 
+            h1v1h2h3_alerts = self.h1v1h2h3_detector.process_candle(
+                instrument_id,
+                candle,
+                candles,
+            )
+            for alert in h1v1h2h3_alerts:
+                self._on_h1v1h2h3_alert(instrument_id, alert)
+
             self._maybe_emit_cooled_signal_alert(instrument_id)
 
         except Exception:
@@ -1553,6 +1566,46 @@ class KiteLiveFeed:
             symbol,
             alert,
         )
+
+    def _on_h1v1h2h3_alert(
+        self,
+        symbol: str,
+        alert: Dict[str, object],
+    ) -> None:
+        if not alert:
+            return
+
+        timestamp_value = alert.get("timestamp")
+        if isinstance(timestamp_value, datetime):
+            if timestamp_value.tzinfo is None:
+                timestamp_value = timestamp_value.replace(tzinfo=IST)
+            timestamp = timestamp_value.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+        direction = str(alert.get("direction", "")).upper()
+        pattern = str(alert.get("pattern", "H1V1H2H3"))
+        h1 = alert.get("h1", "")
+        v1 = alert.get("v1", "")
+        h2 = alert.get("h2", "")
+        h3 = alert.get("h3", "")
+        waiting_minutes = alert.get("waiting_minutes", "")
+
+        print("")
+        print("=" * 60)
+        print("AIMIOS H1V1H2H3 UNIDIRECTIONAL ALERT")
+        print("=" * 60)
+        print(f"TIME       : {timestamp}")
+        print(f"SYMBOL     : {symbol}")
+        print(f"DIRECTION  : {direction}")
+        print(f"PATTERN    : {pattern}")
+        print(f"H1         : {h1}")
+        print(f"V1         : {v1}")
+        print(f"H2         : {h2}")
+        print(f"H3         : {h3}")
+        print(f"WAIT       : {waiting_minutes} min")
+        print("=" * 60)
+        print("")
 
     # ========================================================
     # DAY EXTREME CSV
