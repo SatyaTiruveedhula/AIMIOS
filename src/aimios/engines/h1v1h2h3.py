@@ -16,6 +16,9 @@ INDIA_TZ = ZoneInfo("Asia/Kolkata") if ZoneInfo is not None else None
 
 @dataclass
 class _H1V1H2H3State:
+    reference_open: Optional[float] = None
+    trigger_direction: Optional[str] = None
+    trigger_timestamp: Optional[datetime] = None
     h1: Optional[float] = None
     h1_timestamp: Optional[datetime] = None
     v1: Optional[float] = None
@@ -28,25 +31,23 @@ class _H1V1H2H3State:
 
 
 class H1V1H2H3Detector:
-    """Detect the H1 -> V1 -> H2 > H3 pattern for the first hour high setup.
+    """Detect an unbiased H1 -> V1 -> H2 -> H3 setup from the opening price.
 
     Rules implemented from the user requirement:
-    - H1 is the max high in the first 60 minutes.
-    - V1 is a later low below 99.9% of H1.
-    - H2 is a later high above V1 and below 99.975% of H1.
-    - H3 is a later value below H2 but above 99.925% of H1.
-    - The time gap between H1 and H3 must exceed 30 minutes.
-    - If a new higher H1 is printed after the first hour, the entire state resets.
-    - The detector emits one CE alert and one PE alert per symbol/day once each.
+    - Wait for the market to move 0.5% from the opening price in either direction.
+    - Once the trigger is active, apply the H1 -> V1 -> H2 -> H3 logic on that side.
+    - H1 to V1 distance is 0.2% and H1 to H2 distance is 0.05%.
+    - H3 must be below H2 for the bullish case and above H2 for the reverse case.
+    - The detector emits one CE and one PE alert per symbol/day once each.
     """
 
     def __init__(
         self,
         first_hour_minutes: int = 60,
-        min_wait_minutes: int = 30,
-        h1_v1_drop_pct: float = 0.999,
-        h1_h2_upper_pct: float = 0.99975,
-        h1_h3_lower_pct: float = 0.99925,
+        min_wait_minutes: int = 0,
+        h1_v1_drop_pct: float = 0.002,
+        h1_h2_upper_pct: float = 0.0005,
+        h1_h3_lower_pct: float = 0.0,
     ) -> None:
         self.first_hour_minutes = int(first_hour_minutes)
         self.min_wait_minutes = int(min_wait_minutes)
@@ -107,12 +108,18 @@ class H1V1H2H3Detector:
             day = timestamp.date().isoformat()
         return f"{symbol}:{day}"
 
-    def _first_hour_window(self, candle: Any) -> tuple[datetime, datetime]:
-        candle_dt = self._normalize_datetime(candle.timestamp)
-        market_open = candle_dt.replace(hour=9, minute=15, second=0, microsecond=0)
-        return market_open, market_open + timedelta(minutes=self.first_hour_minutes)
+    def _reference_open(self, sorted_history: List[Any]) -> float:
+        if not sorted_history:
+            return 0.0
+        first = sorted_history[0]
+        if hasattr(first, "open") and first.open is not None:
+            return float(first.open)
+        return (float(first.high) + float(first.low)) / 2.0
 
     def _reset_state(self, state: _H1V1H2H3State) -> None:
+        state.reference_open = None
+        state.trigger_direction = None
+        state.trigger_timestamp = None
         state.h1 = None
         state.h1_timestamp = None
         state.v1 = None
@@ -159,6 +166,159 @@ class H1V1H2H3Detector:
             "logic": "undirectional_h1_v1_h2_h3",
         }
 
+    def _pattern_for_direction(
+        self,
+        sorted_history: List[Any],
+        trigger_timestamp: datetime,
+        direction: str,
+    ) -> Optional[Dict[str, Any]]:
+        reference_open = self._reference_open(sorted_history)
+        v1_gap = reference_open * self.h1_v1_drop_pct
+        h2_gap = reference_open * self.h1_h2_upper_pct
+
+        if direction == "up":
+            h1_candidates = [
+                item
+                for item in sorted_history
+                if self._normalize_datetime(item.timestamp) >= trigger_timestamp
+            ]
+            if not h1_candidates:
+                return None
+            h1 = max(float(item.high) for item in h1_candidates)
+            h1_ts = min(
+                self._normalize_datetime(item.timestamp)
+                for item in h1_candidates
+                if float(item.high) == h1
+            )
+
+            v1_candidates = [
+                item
+                for item in sorted_history
+                if self._normalize_datetime(item.timestamp) >= h1_ts
+                and float(item.low) < (h1 - v1_gap)
+            ]
+            if not v1_candidates:
+                return None
+            v1 = min(float(item.low) for item in v1_candidates)
+            v1_ts = min(
+                self._normalize_datetime(item.timestamp)
+                for item in v1_candidates
+                if float(item.low) == v1
+            )
+
+            h2_candidates = [
+                item
+                for item in sorted_history
+                if self._normalize_datetime(item.timestamp) >= v1_ts
+                and float(item.high) > v1
+                and float(item.high) < h1
+                and float(item.high) >= (h1 - h2_gap)
+            ]
+            if not h2_candidates:
+                return None
+            h2 = max(float(item.high) for item in h2_candidates)
+            h2_ts = min(
+                self._normalize_datetime(item.timestamp)
+                for item in h2_candidates
+                if float(item.high) == h2
+            )
+
+            h3_candidates = [
+                item
+                for item in sorted_history
+                if self._normalize_datetime(item.timestamp) >= h2_ts
+                and float(item.low) < h2
+            ]
+            if not h3_candidates:
+                return None
+            h3 = min(float(item.low) for item in h3_candidates)
+            h3_ts = min(
+                self._normalize_datetime(item.timestamp)
+                for item in h3_candidates
+                if float(item.low) == h3
+            )
+            return {
+                "h1": h1,
+                "h1_ts": h1_ts,
+                "v1": v1,
+                "v1_ts": v1_ts,
+                "h2": h2,
+                "h2_ts": h2_ts,
+                "h3": h3,
+                "h3_ts": h3_ts,
+            }
+
+        h1_candidates = [
+            item
+            for item in sorted_history
+            if self._normalize_datetime(item.timestamp) >= trigger_timestamp
+        ]
+        if not h1_candidates:
+            return None
+        h1 = min(float(item.low) for item in h1_candidates)
+        h1_ts = min(
+            self._normalize_datetime(item.timestamp)
+            for item in h1_candidates
+            if float(item.low) == h1
+        )
+
+        v1_candidates = [
+            item
+            for item in sorted_history
+            if self._normalize_datetime(item.timestamp) >= h1_ts
+            and float(item.high) > (h1 + v1_gap)
+        ]
+        if not v1_candidates:
+            return None
+        v1 = max(float(item.high) for item in v1_candidates)
+        v1_ts = min(
+            self._normalize_datetime(item.timestamp)
+            for item in v1_candidates
+            if float(item.high) == v1
+        )
+
+        h2_candidates = [
+            item
+            for item in sorted_history
+            if self._normalize_datetime(item.timestamp) >= v1_ts
+            and float(item.low) < v1
+            and float(item.low) > h1
+            and float(item.low) <= (h1 + h2_gap)
+        ]
+        if not h2_candidates:
+            return None
+        h2 = min(float(item.low) for item in h2_candidates)
+        h2_ts = min(
+            self._normalize_datetime(item.timestamp)
+            for item in h2_candidates
+            if float(item.low) == h2
+        )
+
+        h3_candidates = [
+            item
+            for item in sorted_history
+            if self._normalize_datetime(item.timestamp) >= h2_ts
+            and float(item.high) > h2
+        ]
+        if not h3_candidates:
+            return None
+        h3 = max(float(item.high) for item in h3_candidates)
+        h3_ts = min(
+            self._normalize_datetime(item.timestamp)
+            for item in h3_candidates
+            if float(item.high) == h3
+        )
+        return {
+            "h1": h1,
+            "h1_ts": h1_ts,
+            "v1": v1,
+            "v1_ts": v1_ts,
+            "h2": h2,
+            "h2_ts": h2_ts,
+            "h3": h3,
+            "h3_ts": h3_ts,
+        }
+
     def process_candle(
         self,
         symbol: str,
@@ -173,100 +333,73 @@ class H1V1H2H3Detector:
         day_key = self._day_key(symbol, candle_dt)
         alerted_today = self._daily_alerts.get(day_key, set())
 
-        market_open, first_hour_end = self._first_hour_window(candle)
-
         sorted_history = self._sorted_history(candles)
-
         if not sorted_history:
             return []
 
-        first_hour_values = [
-            item
-            for item in sorted_history
-            if market_open <= self._normalize_datetime(item.timestamp) < first_hour_end
-        ]
+        if state.reference_open is None:
+            state.reference_open = self._reference_open(sorted_history)
 
-        if first_hour_values:
-            first_hour_high = max(float(item.high) for item in first_hour_values)
-            candidate_h1_ts = min(
-                self._normalize_datetime(item.timestamp)
-                for item in first_hour_values
-                if float(item.high) == first_hour_high
+        if state.trigger_direction is None:
+            ref = float(state.reference_open)
+            trigger_up = any(float(item.high) >= ref * 1.005 for item in sorted_history)
+            trigger_down = any(
+                float(item.low) <= ref * 0.995 for item in sorted_history
             )
-            if state.h1 is None or first_hour_high > float(state.h1):
-                self._reset_state(state)
-                state.h1 = first_hour_high
-                state.h1_timestamp = candidate_h1_ts
+            if not trigger_up and not trigger_down:
+                return []
 
-        if state.h1 is None:
-            state.h1 = float(candle.high)
-            state.h1_timestamp = candle_dt
+            if trigger_up and not trigger_down:
+                state.trigger_direction = "up"
+            elif trigger_down and not trigger_up:
+                state.trigger_direction = "down"
+            else:
+                up_ts = min(
+                    self._normalize_datetime(item.timestamp)
+                    for item in sorted_history
+                    if float(item.high) >= ref * 1.005
+                )
+                down_ts = min(
+                    self._normalize_datetime(item.timestamp)
+                    for item in sorted_history
+                    if float(item.low) <= ref * 0.995
+                )
+                state.trigger_direction = "up" if up_ts <= down_ts else "down"
 
-        if candle_dt >= first_hour_end and candle.high > float(state.h1):
-            self._reset_state(state)
-            state.h1 = float(candle.high)
-            state.h1_timestamp = candle_dt
+            state.trigger_timestamp = min(
+                self._normalize_datetime(item.timestamp)
+                for item in sorted_history
+                if (
+                    (
+                        state.trigger_direction == "up"
+                        and float(item.high) >= ref * 1.005
+                    )
+                    or (
+                        state.trigger_direction == "down"
+                        and float(item.low) <= ref * 0.995
+                    )
+                )
+            )
 
-        if state.h1 is None or state.h1_timestamp is None:
+        setup = self._pattern_for_direction(
+            sorted_history,
+            state.trigger_timestamp,
+            state.trigger_direction,
+        )
+        if setup is None:
             return []
 
-        state.v1 = None
-        state.v1_timestamp = None
-        for item in sorted_history:
-            item_dt = self._normalize_datetime(item.timestamp)
-            if item_dt <= state.h1_timestamp:
-                continue
-            if float(item.low) < float(state.h1) * self.h1_v1_drop_pct:
-                state.v1 = float(item.low)
-                state.v1_timestamp = item_dt
-                break
-
-        if state.v1 is None or state.v1_timestamp is None:
-            return []
-
-        state.h2 = None
-        state.h2_timestamp = None
-        candidate_h2 = None
-        candidate_h2_ts = None
-        for item in sorted_history:
-            item_dt = self._normalize_datetime(item.timestamp)
-            if item_dt <= state.v1_timestamp:
-                continue
-            high_value = float(item.high)
-            if (
-                high_value > float(state.v1)
-                and high_value < float(state.h1) * self.h1_h2_upper_pct
-            ):
-                if candidate_h2 is None or high_value > candidate_h2:
-                    candidate_h2 = high_value
-                    candidate_h2_ts = item_dt
-
-        if candidate_h2 is not None and candidate_h2_ts is not None:
-            state.h2 = candidate_h2
-            state.h2_timestamp = candidate_h2_ts
-
-        if state.h2 is None or state.h2_timestamp is None:
-            return []
-
-        state.h3 = None
-        state.h3_timestamp = None
-        for item in sorted_history:
-            item_dt = self._normalize_datetime(item.timestamp)
-            if item_dt <= state.h2_timestamp:
-                continue
-            value = float(item.low)
-            if value > float(state.h1) * self.h1_h3_lower_pct and value < float(
-                state.h2
-            ):
-                state.h3 = value
-                state.h3_timestamp = item_dt
-                break
-
-        if state.h3 is None or state.h3_timestamp is None:
-            return []
+        state.h1 = float(setup["h1"])
+        state.h1_timestamp = setup["h1_ts"]
+        state.v1 = float(setup["v1"])
+        state.v1_timestamp = setup["v1_ts"]
+        state.h2 = float(setup["h2"])
+        state.h2_timestamp = setup["h2_ts"]
+        state.h3 = float(setup["h3"])
+        state.h3_timestamp = setup["h3_ts"]
 
         elapsed_minutes = (
-            state.h3_timestamp - state.h1_timestamp
+            state.h3_timestamp - state.trigger_timestamp
         ).total_seconds() / 60.0
         if elapsed_minutes <= self.min_wait_minutes:
             return []
@@ -275,29 +408,18 @@ class H1V1H2H3Detector:
         for direction in ("CE", "PE"):
             if direction in alerted_today:
                 continue
-            if direction == "CE":
-                alert = self._build_alert(
+            alerts.append(
+                self._build_alert(
                     symbol,
                     candle,
-                    "CE",
+                    direction,
                     h1=float(state.h1),
                     v1=float(state.v1),
                     h2=float(state.h2),
                     h3=float(state.h3),
                     waiting_minutes=elapsed_minutes,
                 )
-            else:
-                alert = self._build_alert(
-                    symbol,
-                    candle,
-                    "PE",
-                    h1=float(state.h1),
-                    v1=float(state.v1),
-                    h2=float(state.h2),
-                    h3=float(state.h3),
-                    waiting_minutes=elapsed_minutes,
-                )
-            alerts.append(alert)
+            )
             alerted_today.add(direction)
 
         self._daily_alerts[day_key] = alerted_today

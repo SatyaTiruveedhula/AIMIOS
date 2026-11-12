@@ -216,6 +216,11 @@ class KiteLiveFeed:
             MarketSnapshot,
         ] = {}
 
+        self._last_high_low_print: Dict[
+            str,
+            tuple[float, float],
+        ] = {}
+
         self._last_health_print = 0.0
 
         self._snapshot_printed_initial = False
@@ -747,8 +752,12 @@ class KiteLiveFeed:
 
         status_parts: List[str] = []
 
-        sell_setup = self.day_extreme_sentinel.get_m_setup(instrument_id)
-        buy_setup = self.day_extreme_sentinel.get_w_setup(instrument_id)
+        sentinel = getattr(self, "day_extreme_sentinel", None)
+        if sentinel is None:
+            return "WATCH | NONE"
+
+        sell_setup = sentinel.get_m_setup(instrument_id)
+        buy_setup = sentinel.get_w_setup(instrument_id)
 
         snapshot = (
             self._last_snapshots.get(instrument_id)
@@ -882,13 +891,35 @@ class KiteLiveFeed:
         self,
     ) -> None:
 
-        if not self._snapshot_printed_initial and self._last_snapshots:
+        if not self._last_snapshots:
+            return
+
+        if not self._snapshot_printed_initial:
             self._snapshot_printed_initial = True
+            for instrument_id, snapshot in self._last_snapshots.items():
+                try:
+                    self._last_high_low_print[instrument_id] = (
+                        float(snapshot.high),
+                        float(snapshot.low),
+                    )
+                except AttributeError:
+                    pass
             self._print_complete_market_snapshot()
             self._last_15min_snapshot_epoch = time.time()
             return
 
-        # TEMPORARILY disabled: no periodic 15-minute snapshot prints.
+        for instrument_id, snapshot in self._last_snapshots.items():
+            try:
+                current_high_low = (float(snapshot.high), float(snapshot.low))
+            except AttributeError, TypeError, ValueError:
+                continue
+
+            previous_high_low = self._last_high_low_print.get(instrument_id)
+            if previous_high_low is None or previous_high_low != current_high_low:
+                self._last_high_low_print[instrument_id] = current_high_low
+                self._print_complete_market_snapshot()
+                return
+
         return
 
     # ========================================================
