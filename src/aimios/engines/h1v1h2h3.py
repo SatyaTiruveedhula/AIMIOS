@@ -394,6 +394,12 @@ class H1V1H2H3Detector:
             if setup is None:
                 continue
 
+            previous_h2 = state.h2
+            if previous_h2 is None or float(setup["h2"]) != float(previous_h2):
+                print(
+                    f"H2 reached for {symbol} ({alert_direction}) — preparing / waiting for final H3 alert"
+                )
+
             h3_ts = setup["h3_ts"]
             elapsed_minutes = (h3_ts - state.trigger_timestamp).total_seconds() / 60.0
             if elapsed_minutes <= self.min_wait_minutes:
