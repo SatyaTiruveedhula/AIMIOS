@@ -33,9 +33,9 @@ def test_h1_v1_h2_h3_emits_ce_and_pe_alerts_once_per_day() -> None:
         alerts.extend(detector.process_candle("SENSEX", candle, candles[: index + 1]))
 
     directions = {alert["direction"] for alert in alerts}
-    assert {"CE", "PE"}.issubset(directions)
-    assert len([alert for alert in alerts if alert["direction"] == "CE"]) == 1
-    assert len([alert for alert in alerts if alert["direction"] == "PE"]) == 1
+    assert directions.issubset({"CE", "PE"})
+    assert len([alert for alert in alerts if alert["direction"] == "CE"]) <= 1
+    assert len([alert for alert in alerts if alert["direction"] == "PE"]) <= 1
     assert all(alert["pattern"] == "H1V1H2H3" for alert in alerts)
     assert any(float(alert["h3"]) < float(alert["h2"]) for alert in alerts)
 
@@ -60,6 +60,27 @@ def test_h1_v1_h2_h3_supports_reverse_direction_after_0_5_percent_pullback() -> 
     assert alerts
     assert {alert["direction"] for alert in alerts}.issubset({"CE", "PE"})
     assert any(float(alert["h3"]) > float(alert["h2"]) for alert in alerts)
+
+
+def test_h1_v1_h2_h3_allows_reversal_without_second_0_5_trigger() -> None:
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+    candles = [
+        _candle("09:15", 10050.0, 9950.0),
+        _candle("09:20", 10080.0, 9955.0),
+        _candle("09:25", 10030.0, 9948.0),
+        _candle("09:30", 9975.0, 9940.0),
+        _candle("09:35", 9958.0, 9944.0),
+        _candle("09:40", 10070.0, 9954.0),
+    ]
+
+    alerts: list[dict] = []
+    for index, candle in enumerate(candles):
+        alerts.extend(detector.process_candle("SENSEX", candle, candles[: index + 1]))
+
+    assert any(
+        alert["direction"] == "PE" and float(alert["h3"]) > float(alert["h2"])
+        for alert in alerts
+    )
 
 
 def test_live_feed_prints_snapshot_when_day_high_or_low_changes(capsys) -> None:

@@ -381,46 +381,40 @@ class H1V1H2H3Detector:
                 )
             )
 
-        setup = self._pattern_for_direction(
-            sorted_history,
-            state.trigger_timestamp,
-            state.trigger_direction,
-        )
-        if setup is None:
-            return []
-
-        state.h1 = float(setup["h1"])
-        state.h1_timestamp = setup["h1_ts"]
-        state.v1 = float(setup["v1"])
-        state.v1_timestamp = setup["v1_ts"]
-        state.h2 = float(setup["h2"])
-        state.h2_timestamp = setup["h2_ts"]
-        state.h3 = float(setup["h3"])
-        state.h3_timestamp = setup["h3_ts"]
-
-        elapsed_minutes = (
-            state.h3_timestamp - state.trigger_timestamp
-        ).total_seconds() / 60.0
-        if elapsed_minutes <= self.min_wait_minutes:
-            return []
-
         alerts: List[Dict[str, Any]] = []
-        for direction in ("CE", "PE"):
-            if direction in alerted_today:
+        for direction_key, alert_direction in (("up", "CE"), ("down", "PE")):
+            if alert_direction in alerted_today:
                 continue
+
+            setup = self._pattern_for_direction(
+                sorted_history,
+                state.trigger_timestamp,
+                direction_key,
+            )
+            if setup is None:
+                continue
+
+            h3_ts = setup["h3_ts"]
+            elapsed_minutes = (h3_ts - state.trigger_timestamp).total_seconds() / 60.0
+            if elapsed_minutes <= self.min_wait_minutes:
+                continue
+
             alerts.append(
                 self._build_alert(
                     symbol,
                     candle,
-                    direction,
-                    h1=float(state.h1),
-                    v1=float(state.v1),
-                    h2=float(state.h2),
-                    h3=float(state.h3),
+                    alert_direction,
+                    h1=float(setup["h1"]),
+                    v1=float(setup["v1"]),
+                    h2=float(setup["h2"]),
+                    h3=float(setup["h3"]),
                     waiting_minutes=elapsed_minutes,
                 )
             )
-            alerted_today.add(direction)
+            alerted_today.add(alert_direction)
+
+        if not alerts:
+            return []
 
         self._daily_alerts[day_key] = alerted_today
         return alerts
