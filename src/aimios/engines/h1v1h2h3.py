@@ -46,7 +46,7 @@ class H1V1H2H3Detector:
         first_hour_minutes: int = 60,
         min_wait_minutes: int = 0,
         h1_v1_drop_pct: float = 0.002,
-        h1_h2_upper_pct: float = 0.0005,
+        h1_h2_upper_pct: float = 0.0009,
         h1_h3_lower_pct: float = 0.0,
     ) -> None:
         self.first_hour_minutes = int(first_hour_minutes)
@@ -393,6 +393,12 @@ class H1V1H2H3Detector:
             )
             if setup is None:
                 continue
+
+            previous_v1 = state.v1
+            if previous_v1 is None or float(setup["v1"]) != float(previous_v1):
+                print(
+                    f"V1 reached for {symbol} ({alert_direction}) — pattern moving toward H2"
+                )
 
             previous_h2 = state.h2
             if previous_h2 is None or float(setup["h2"]) != float(previous_h2):
