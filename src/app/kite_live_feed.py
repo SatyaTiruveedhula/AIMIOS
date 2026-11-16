@@ -1624,7 +1624,11 @@ class KiteLiveFeed:
 
         print("")
         print("=" * 60)
-        print("AIMIOS H1V1H2H3 UNIDIRECTIONAL ALERT")
+        print("AIMIOS EXCLUSIVE H1V1H2H3 ALERT")
+        print("LOGIC      : H1V1H2H3")
+        print("SOURCE     : h1v1h2h3 detector")
+        print("NOTE       : THIS IS THE H1V1H2H3 LOGIC — NOT M/W")
+        print("ACTION     : TAKE ACTION NOW")
         print("=" * 60)
         print(f"TIME       : {timestamp}")
         print(f"SYMBOL     : {symbol}")
