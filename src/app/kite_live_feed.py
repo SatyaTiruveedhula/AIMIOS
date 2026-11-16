@@ -151,7 +151,19 @@ class KiteLiveFeed:
         # USER-INITIATED PRICE ALERTS
         # ====================================================
 
-        self.user_alert_manager = UserInitiatedPriceAlertManager(DEFAULT_USER_ALERTS)
+        self.user_alerts_path = PROJECT_ROOT / "config" / "user_alerts.json"
+        self.user_alerts_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not self.user_alerts_path.exists():
+            self.user_alerts_path.write_text(
+                json.dumps(DEFAULT_USER_ALERTS, indent=2),
+                encoding="utf-8",
+            )
+
+        self.user_alert_manager = UserInitiatedPriceAlertManager(
+            config_path=self.user_alerts_path,
+        )
+        self._user_alerts_last_mtime = self.user_alerts_path.stat().st_mtime
 
         # ====================================================
         # THREAD / CONTROL
@@ -1230,6 +1242,7 @@ class KiteLiveFeed:
 
                 self._last_prices[instrument_id] = snapshot.ltp
                 self._last_snapshots[instrument_id] = snapshot
+                self._reload_user_alerts_if_needed()
                 self.user_alert_manager.process_snapshot(instrument_id, snapshot)
                 self._save_runtime_state()
                 self._maybe_print_snapshots()
@@ -1453,6 +1466,27 @@ class KiteLiveFeed:
                 "Day extreme processing failed for %s",
                 instrument_id,
             )
+
+    def _reload_user_alerts_if_needed(self) -> None:
+        if not self.user_alerts_path.exists():
+            return
+
+        current_mtime = self.user_alerts_path.stat().st_mtime
+        if current_mtime == self._user_alerts_last_mtime:
+            return
+
+        active_count = self.user_alert_manager.reload_from_file(self.user_alerts_path)
+        self._user_alerts_last_mtime = current_mtime
+        print(
+            f"USER ALERTS RELOADED | config={self.user_alerts_path.name} | "
+            f"active={active_count}"
+        )
+
+    def reload_user_alerts(self) -> None:
+        if not self.user_alerts_path.exists():
+            return
+        self._user_alerts_last_mtime = 0.0
+        self._reload_user_alerts_if_needed()
 
     def _maybe_emit_cooled_signal_alert(
         self,

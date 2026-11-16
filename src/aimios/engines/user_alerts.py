@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -23,14 +25,22 @@ class UserInitiatedPriceAlertManager:
     such as: "alert me when SENSEX reaches 80500".
     """
 
-    def __init__(self, alerts: Iterable[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        alerts: Iterable[dict[str, Any]] | None = None,
+        config_path: str | Path | None = None,
+    ) -> None:
         self._alerts: dict[str, UserAlertConfig] = {}
         self._triggered: set[str] = set()
+        self._config_path: Path | None = None
 
-        for alert in alerts or []:
-            config = self._coerce_alert(alert)
-            if config is not None:
-                self._alerts[config.match_key()] = config
+        if config_path is not None:
+            self.load_from_file(config_path)
+        else:
+            for alert in alerts or []:
+                config = self._coerce_alert(alert)
+                if config is not None:
+                    self._alerts[config.match_key()] = config
 
     @staticmethod
     def _coerce_alert(alert: dict[str, Any]) -> UserAlertConfig | None:
@@ -76,6 +86,43 @@ class UserInitiatedPriceAlertManager:
             enabled=True,
         )
         self._alerts[config.match_key()] = config
+
+    def load_from_file(self, path: str | Path) -> int:
+        resolved = Path(path)
+        self._config_path = resolved
+
+        if not resolved.exists():
+            self._alerts.clear()
+            self._triggered.clear()
+            return 0
+
+        try:
+            content = resolved.read_text(encoding="utf-8")
+            payload = json.loads(content)
+        except OSError, ValueError, TypeError:
+            return 0
+
+        entries: Any
+        if isinstance(payload, dict):
+            entries = payload.get("alerts", payload.get("watch_list", []))
+        else:
+            entries = payload
+
+        if not isinstance(entries, list):
+            return 0
+
+        alerts: dict[str, UserAlertConfig] = {}
+        for entry in entries:
+            config = self._coerce_alert(entry)
+            if config is not None:
+                alerts[config.match_key()] = config
+
+        self._alerts = alerts
+        self._triggered.clear()
+        return len(self._alerts)
+
+    def reload_from_file(self, path: str | Path) -> int:
+        return self.load_from_file(path)
 
     def process_price(self, symbol: str, current_price: float) -> None:
         if current_price is None:
