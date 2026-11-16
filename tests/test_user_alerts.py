@@ -106,3 +106,31 @@ def test_user_alert_manager_fires_if_price_is_already_above_trigger_on_reload(
     assert "USER INITIATED ALERT" in captured
     assert "NIFTY" in captured
     assert "25254.20" in captured
+
+
+def test_user_alert_manager_emits_a_light_beep_when_triggered(monkeypatch) -> None:
+    calls = []
+
+    def fake_beep(freq: int = 900, duration_ms: int = 180) -> None:
+        calls.append((freq, duration_ms))
+
+    import aimios.engines.user_alerts as user_alerts
+
+    monkeypatch.setattr(user_alerts, "play_alert_beep", fake_beep)
+
+    manager = UserInitiatedPriceAlertManager(
+        [
+            {
+                "symbol": "NIFTY",
+                "trigger_price": 25250.0,
+                "direction": "up",
+                "label": "manual target",
+            }
+        ]
+    )
+
+    manager.process_price("NIFTY", 25260.0)
+
+    assert calls
+    assert calls[0][0] > 0
+    assert calls[0][1] > 0

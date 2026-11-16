@@ -5,6 +5,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    import winsound
+except ImportError:  # pragma: no cover - non-Windows safe fallback
+    winsound = None
+
+
+def play_alert_beep(frequency_hz: int = 900, duration_ms: int = 180) -> None:
+    """Play a short, non-intrusive beep when a user alert fires."""
+    if winsound is None:
+        return
+
+    try:
+        winsound.Beep(frequency_hz, duration_ms)
+    except Exception:
+        pass
+
 
 @dataclass(frozen=True)
 class UserAlertConfig:
@@ -155,6 +171,7 @@ class UserInitiatedPriceAlertManager:
 
     def _fire(self, alert: UserAlertConfig, current_price: float) -> None:
         self._triggered.add(alert.match_key())
+        play_alert_beep()
         print("")
         print("=" * 60)
         print("AIMIOS USER INITIATED ALERT")
