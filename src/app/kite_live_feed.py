@@ -25,6 +25,7 @@ from aimios.engines.day_extreme_pattern_sentinel import (
     DayExtremePatternSentinel,
 )
 from aimios.engines.h1v1h2h3 import H1V1H2H3Detector
+from aimios.engines.user_alerts import UserInitiatedPriceAlertManager
 
 try:
     from kiteconnect import KiteTicker
@@ -50,6 +51,15 @@ IST = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_INSTRUMENT_IDS = [
     "SENSEX",
+]
+
+DEFAULT_USER_ALERTS = [
+    {
+        "symbol": "SENSEX",
+        "trigger_price": 80500.0,
+        "direction": "down",
+        "label": "manual target",
+    }
 ]
 
 
@@ -136,6 +146,12 @@ class KiteLiveFeed:
         # ====================================================
 
         self.h1v1h2h3_detector = H1V1H2H3Detector()
+
+        # ====================================================
+        # USER-INITIATED PRICE ALERTS
+        # ====================================================
+
+        self.user_alert_manager = UserInitiatedPriceAlertManager(DEFAULT_USER_ALERTS)
 
         # ====================================================
         # THREAD / CONTROL
@@ -1214,6 +1230,7 @@ class KiteLiveFeed:
 
                 self._last_prices[instrument_id] = snapshot.ltp
                 self._last_snapshots[instrument_id] = snapshot
+                self.user_alert_manager.process_snapshot(instrument_id, snapshot)
                 self._save_runtime_state()
                 self._maybe_print_snapshots()
 
