@@ -83,6 +83,58 @@ def test_h1_v1_h2_h3_allows_reversal_without_second_0_5_trigger() -> None:
     )
 
 
+def test_h1_v1_h2_h3_logs_only_final_alert_not_prepare_messages(
+    capsys, monkeypatch
+) -> None:
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+    candles = [
+        _candle("09:15", 82020.0, 81980.0),
+        _candle("09:20", 82310.0, 82200.0),
+        _candle("09:25", 82460.0, 82390.0),
+        _candle("09:30", 82490.0, 82420.0),
+        _candle("09:35", 82400.0, 82310.0),
+        _candle("09:40", 82455.0, 82390.0),
+        _candle("09:45", 82475.0, 82410.0),
+        _candle("09:50", 82440.0, 82400.0),
+        _candle("09:55", 82430.0, 82390.0),
+    ]
+
+    for index, candle in enumerate(candles):
+        detector.process_candle("SENSEX", candle, candles[: index + 1])
+
+    captured_before = capsys.readouterr().out
+    assert "PREPARE ACTION" not in captured_before
+
+    calls = []
+
+    def fake_beep(freq: int = 1400, duration_ms: int = 220) -> None:
+        calls.append((freq, duration_ms))
+
+    import app.kite_live_feed as kite_live_feed
+
+    monkeypatch.setattr(kite_live_feed, "play_pattern_alert_beep", fake_beep)
+
+    feed = KiteLiveFeed.__new__(KiteLiveFeed)
+    feed._on_h1v1h2h3_alert(
+        "NIFTY",
+        {
+            "timestamp": datetime(2026, 11, 12, 10, 20),
+            "direction": "CE",
+            "pattern": "H1V1H2H3",
+            "h1": 25290.0,
+            "v1": 25270.0,
+            "h2": 25280.0,
+            "h3": 25295.0,
+            "waiting_minutes": 10,
+        },
+    )
+
+    captured_after = capsys.readouterr().out
+    assert "AIMIOS EXCLUSIVE H1V1H2H3 ALERT" in captured_after
+    assert "TAKE ACTION NOW" in captured_after
+    assert calls
+
+
 def test_live_feed_prints_snapshot_when_day_high_or_low_changes(capsys) -> None:
     feed = KiteLiveFeed.__new__(KiteLiveFeed)
     feed._last_snapshots = {

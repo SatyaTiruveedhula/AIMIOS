@@ -116,7 +116,7 @@ def test_user_alert_manager_emits_a_light_beep_when_triggered(monkeypatch) -> No
 
     import aimios.engines.user_alerts as user_alerts
 
-    monkeypatch.setattr(user_alerts, "play_alert_beep", fake_beep)
+    monkeypatch.setattr(user_alerts, "play_user_alert_beep", fake_beep)
 
     manager = UserInitiatedPriceAlertManager(
         [

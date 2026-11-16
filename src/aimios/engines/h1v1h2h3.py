@@ -398,28 +398,16 @@ class H1V1H2H3Detector:
             if previous_h1 is None or float(setup["h1"]) != float(previous_h1):
                 state.h1 = float(setup["h1"])
                 state.h1_timestamp = setup["h1_ts"]
-                print(
-                    f"H1V1H2H3 | {symbol} | {alert_direction} | H1 hit at {state.h1:.2f} | "
-                    f"PREPARE ACTION | waiting for V1"
-                )
 
             previous_v1 = state.v1
             if previous_v1 is None or float(setup["v1"]) != float(previous_v1):
                 state.v1 = float(setup["v1"])
                 state.v1_timestamp = setup["v1_ts"]
-                print(
-                    f"H1V1H2H3 | {symbol} | {alert_direction} | V1 hit at {state.v1:.2f} | "
-                    f"PREPARE ACTION | waiting for H2"
-                )
 
             previous_h2 = state.h2
             if previous_h2 is None or float(setup["h2"]) != float(previous_h2):
                 state.h2 = float(setup["h2"])
                 state.h2_timestamp = setup["h2_ts"]
-                print(
-                    f"H1V1H2H3 | {symbol} | {alert_direction} | H2 hit at {state.h2:.2f} | "
-                    f"PREPARE ACTION | waiting for final H3 alert"
-                )
 
             h3_ts = setup["h3_ts"]
             elapsed_minutes = (h3_ts - state.trigger_timestamp).total_seconds() / 60.0

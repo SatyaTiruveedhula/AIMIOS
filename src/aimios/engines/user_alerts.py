@@ -11,8 +11,8 @@ except ImportError:  # pragma: no cover - non-Windows safe fallback
     winsound = None
 
 
-def play_alert_beep(frequency_hz: int = 900, duration_ms: int = 180) -> None:
-    """Play a short, non-intrusive beep when a user alert fires."""
+def play_user_alert_beep(frequency_hz: int = 900, duration_ms: int = 180) -> None:
+    """Play a short, non-intrusive beep for user-triggered manual alerts."""
     if winsound is None:
         return
 
@@ -20,6 +20,22 @@ def play_alert_beep(frequency_hz: int = 900, duration_ms: int = 180) -> None:
         winsound.Beep(frequency_hz, duration_ms)
     except Exception:
         pass
+
+
+def play_pattern_alert_beep(frequency_hz: int = 1400, duration_ms: int = 220) -> None:
+    """Play a distinct, slightly sharper beep for final pattern alerts."""
+    if winsound is None:
+        return
+
+    try:
+        winsound.Beep(frequency_hz, duration_ms)
+    except Exception:
+        pass
+
+
+def play_alert_beep(frequency_hz: int = 900, duration_ms: int = 180) -> None:
+    """Backward-compatible alias for user alerts."""
+    play_user_alert_beep(frequency_hz=frequency_hz, duration_ms=duration_ms)
 
 
 @dataclass(frozen=True)
@@ -171,7 +187,7 @@ class UserInitiatedPriceAlertManager:
 
     def _fire(self, alert: UserAlertConfig, current_price: float) -> None:
         self._triggered.add(alert.match_key())
-        play_alert_beep()
+        play_user_alert_beep()
         print("")
         print("=" * 60)
         print("AIMIOS USER INITIATED ALERT")

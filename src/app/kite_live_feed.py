@@ -25,7 +25,10 @@ from aimios.engines.day_extreme_pattern_sentinel import (
     DayExtremePatternSentinel,
 )
 from aimios.engines.h1v1h2h3 import H1V1H2H3Detector
-from aimios.engines.user_alerts import UserInitiatedPriceAlertManager
+from aimios.engines.user_alerts import (
+    UserInitiatedPriceAlertManager,
+    play_pattern_alert_beep,
+)
 
 try:
     from kiteconnect import KiteTicker
@@ -1678,6 +1681,8 @@ class KiteLiveFeed:
         h2 = alert.get("h2", "")
         h3 = alert.get("h3", "")
         waiting_minutes = alert.get("waiting_minutes", "")
+
+        play_pattern_alert_beep()
 
         print("")
         print("=" * 60)
