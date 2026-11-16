@@ -63,3 +63,39 @@ def test_user_alert_manager_loads_json_file_and_reloads(tmp_path: Path) -> None:
     assert count == 1
     assert "reloaded target" in next(iter(manager._alerts.values())).label
     assert next(iter(manager._alerts.values())).trigger_price == 80750.0
+
+
+def test_user_alert_manager_fires_if_price_is_already_above_trigger_on_reload(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "user_alerts.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "symbol": "NIFTY",
+                    "trigger_price": 25250.0,
+                    "direction": "up",
+                    "label": "manual target",
+                    "enabled": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    manager = UserInitiatedPriceAlertManager(config_path=config_path)
+    manager.process_snapshot(
+        "NIFTY",
+        type(
+            "Snapshot",
+            (),
+            {"ltp": 25254.20},
+        )(),
+    )
+
+    captured = capsys.readouterr().out
+    assert "USER INITIATED ALERT" in captured
+    assert "NIFTY" in captured
+    assert "25254.20" in captured

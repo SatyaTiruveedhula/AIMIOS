@@ -1477,6 +1477,10 @@ class KiteLiveFeed:
 
         active_count = self.user_alert_manager.reload_from_file(self.user_alerts_path)
         self._user_alerts_last_mtime = current_mtime
+
+        for symbol, snapshot in list(getattr(self, "_last_snapshots", {}).items()):
+            self.user_alert_manager.process_snapshot(symbol, snapshot)
+
         print(
             f"USER ALERTS RELOADED | config={self.user_alerts_path.name} | "
             f"active={active_count}"
