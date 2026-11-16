@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from app.kite_live_feed import KiteLiveFeed
 from aimios.engines.user_alerts import UserInitiatedPriceAlertManager
 
 
@@ -24,6 +25,12 @@ def test_user_price_alert_triggers_at_custom_level(capsys) -> None:
     assert "SENSEX" in output
     assert "80500.00" in output
     assert "manual target" in output
+
+
+def test_kite_live_feed_marks_index_symbols_as_active() -> None:
+    assert KiteLiveFeed._is_active_alert_symbol("NIFTY") is True
+    assert KiteLiveFeed._is_active_alert_symbol("BANKNIFTY") is True
+    assert KiteLiveFeed._is_active_alert_symbol("SENSEX") is True
 
 
 def test_user_alert_manager_loads_json_file_and_reloads(tmp_path: Path) -> None:
