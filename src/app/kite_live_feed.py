@@ -25,6 +25,7 @@ from aimios.engines.day_extreme_pattern_sentinel import (
     DayExtremePatternSentinel,
 )
 from aimios.engines.h1v1h2h3 import H1V1H2H3Detector
+from aimios.engines.macro_alerts import MacroNewsManager
 from aimios.engines.user_alerts import (
     UserInitiatedPriceAlertManager,
     play_pattern_alert_beep,
@@ -145,6 +146,14 @@ class KiteLiveFeed:
         # ====================================================
 
         self.day_extreme_sentinel = DayExtremePatternSentinel()
+
+        # ====================================================
+        # MACRO NEWS / EVENT SUMMARY
+        # ====================================================
+
+        self.macro_news_manager = MacroNewsManager()
+        self._macro_summary_day = None
+        self._macro_summary_slots: set[str] = set()
 
         # ====================================================
         # H1V1H2H3 UNDIRECTIONAL ALERTS
@@ -716,6 +725,7 @@ class KiteLiveFeed:
         self._stop_event.clear()
         self._ready.clear()
         self._restore_runtime_state()
+        self._emit_macro_summary("STARTUP")
 
         reconnect_delay = 5
 
@@ -726,6 +736,7 @@ class KiteLiveFeed:
                 reconnect_delay = 5
 
                 while not self._stop_event.wait(timeout=1):
+                    self._maybe_emit_macro_summary()
                     if not self._ready.is_set():
                         break
             except Exception:
@@ -744,6 +755,26 @@ class KiteLiveFeed:
 
         print("")
         print("Live feed loop exited.")
+
+    def _reset_macro_summary_slots_if_needed(self) -> None:
+        today_key = datetime.now(IST).date().isoformat()
+        if self._macro_summary_day != today_key:
+            self._macro_summary_day = today_key
+            self._macro_summary_slots.clear()
+
+    def _emit_macro_summary(self, stage: str) -> None:
+        self._reset_macro_summary_slots_if_needed()
+        if stage in self._macro_summary_slots:
+            return
+        self._macro_summary_slots.add(stage)
+        print(self.macro_news_manager.format_summary(stage))
+
+    def _maybe_emit_macro_summary(self) -> None:
+        self._reset_macro_summary_slots_if_needed()
+        now = datetime.now(IST)
+        if now.hour > 15 or (now.hour == 15 and now.minute >= 30):
+            if "15:30 IST" not in self._macro_summary_slots:
+                self._emit_macro_summary("15:30 IST")
 
     def _print_complete_market_snapshot(
         self,
