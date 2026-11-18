@@ -6,7 +6,7 @@ import logging
 import signal
 import time
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Dict, List, Optional
@@ -439,6 +439,16 @@ class KiteLiveFeed:
             "m_setup": [],
             "w_setup": [],
             "day_extremes": {},
+            "candle_buffer": (
+                self.candle_buffer.export_runtime_state()
+                if hasattr(self, "candle_buffer")
+                else {}
+            ),
+            "h1v1h2h3": (
+                self.h1v1h2h3_detector.export_state()
+                if hasattr(self, "h1v1h2h3_detector")
+                else {"daily_state": {}, "daily_alerts": {}}
+            ),
         }
 
         for instrument_id, snapshot in self._last_snapshots.items():
@@ -657,6 +667,42 @@ class KiteLiveFeed:
             ):
                 self.day_extreme_sentinel._last_day_low[str(symbol)] = float(value)
 
+        # Restore candle buffer state
+        if "candle_buffer" in payload:
+            candle_buffer_payload = payload["candle_buffer"]
+            if not isinstance(candle_buffer_payload, dict) or not candle_buffer_payload:
+                if not hasattr(self, "candle_buffer"):
+                    self.candle_buffer = CandleBuffer()
+            else:
+                if not hasattr(self, "candle_buffer"):
+                    self.candle_buffer = CandleBuffer()
+                self.candle_buffer.restore_runtime_state(candle_buffer_payload)
+
+        # Restore H1V1H2H3 detector state
+        if "h1v1h2h3" in payload:
+            if not hasattr(self, "h1v1h2h3_detector"):
+                self.h1v1h2h3_detector = H1V1H2H3Detector()
+            self.h1v1h2h3_detector.restore_state(payload["h1v1h2h3"])
+
+        # Reconcile every restored symbol against preserved intraday OHLC candles.
+        # This adjusts H1/V1/H2/H3 immediately after restart and also lets live
+        # ticks extend whichever stage was already forming.
+        if hasattr(self.candle_buffer, "get_completed"):
+            for instrument_id in getattr(self, "instrument_ids", []):
+                candles = self.candle_buffer.get_completed(str(instrument_id), 500)
+                live_candle = self.candle_buffer.get_latest(str(instrument_id))
+                if live_candle is not None:
+                    combined = list(candles)
+                    if not combined or combined[-1].timestamp != live_candle.timestamp:
+                        combined.append(live_candle)
+                else:
+                    combined = list(candles)
+                if combined:
+                    self.h1v1h2h3_detector.reconcile_from_history(
+                        str(instrument_id),
+                        combined,
+                    )
+
     # ========================================================
     # START
     # ========================================================
@@ -697,6 +743,8 @@ class KiteLiveFeed:
         self._ticker.on_error = self._on_error
 
         self._resolve_subscription_tokens()
+
+        self._replay_intraday_history()
 
         print("Subscription symbols:", self._subscription_symbols)
         print("Subscription tokens:", self._subscription_tokens)
@@ -1087,6 +1135,9 @@ class KiteLiveFeed:
 
         print("FULL market-data mode enabled.")
 
+        self._replay_intraday_history()
+        self._save_runtime_state()
+
         self._ready.set()
 
     # ========================================================
@@ -1303,7 +1354,31 @@ class KiteLiveFeed:
                 # EXISTING CANDLE ENGINE
                 # --------------------------------------------
 
+                # Existing candle engine updates live OHLC. Rebuild the
+                # H1/V1/H2/H3 stages from that continuously adjusted history.
                 self.candle_buffer.update(snapshot)
+
+                try:
+                    reconciled_candles = list(
+                        self.candle_buffer.get_completed(str(instrument_id), 500)
+                    )
+                    live_candle = self.candle_buffer.get_latest(str(instrument_id))
+                    if live_candle is not None:
+                        if (
+                            not reconciled_candles
+                            or reconciled_candles[-1].timestamp != live_candle.timestamp
+                        ):
+                            reconciled_candles.append(live_candle)
+                    if reconciled_candles:
+                        self.h1v1h2h3_detector.reconcile_from_history(
+                            str(instrument_id),
+                            reconciled_candles,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed live H1V1H2H3 reconciliation for %s",
+                        instrument_id,
+                    )
 
                 # --------------------------------------------
                 # DAY EXTREME ENGINE
@@ -1980,6 +2055,26 @@ class KiteLiveFeed:
             previous_close=previous_close,
         )
 
+        # Broker OHLC is authoritative and may update immediately after
+        # restart. Reconcile pattern points without waiting for completion
+        # of the next candle so H1/V1/H2/H3 continue expanding in real time.
+        try:
+            candles = list(self.candle_buffer.get_completed(str(instrument_id), 500))
+            live_candle = self.candle_buffer.get_latest(str(instrument_id))
+            if live_candle is not None:
+                if not candles or candles[-1].timestamp != live_candle.timestamp:
+                    candles.append(live_candle)
+            if candles:
+                self.h1v1h2h3_detector.reconcile_from_history(
+                    str(instrument_id),
+                    candles,
+                )
+        except Exception:
+            logger.exception(
+                "Failed immediate H1V1H2H3 reconciliation for %s",
+                instrument_id,
+            )
+
         # ----------------------------------------------------
         # BROKER SYNC MESSAGE
         #
@@ -2385,10 +2480,148 @@ class KiteLiveFeed:
                 }
             )
 
+    # ========================================================
+    # REPLAY INTRADAY HISTORY
+    # ========================================================
 
-# ============================================================
-# MAIN
-# ============================================================
+    def _replay_intraday_history(self) -> None:
+        """Replay the market day's missing 1-minute candles after restart/reconnect."""
+        if self._broker.client is None:
+            return
+
+        now = datetime.now(IST)
+        start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+
+        token_by_symbol = {
+            "NIFTY": 256265,
+            "BANKNIFTY": 260105,
+            "SENSEX": 265,
+        }
+        exchange_symbol = {
+            "NIFTY": "NSE:NIFTY 50",
+            "BANKNIFTY": "NSE:NIFTY BANK",
+            "SENSEX": "BSE:SENSEX",
+        }
+
+        for instrument_id in getattr(self, "instrument_ids", []):
+            symbol = str(instrument_id)
+            token = token_by_symbol.get(symbol)
+            if token is None:
+                continue
+
+            for subscribed_token, mapped_symbol in getattr(
+                self, "_instrument_id_by_token", {}
+            ).items():
+                if str(mapped_symbol) == symbol:
+                    token = int(subscribed_token)
+                    break
+
+            try:
+                quote = self._broker.get_quote(exchange_symbol[symbol])
+                quote_payload = None
+                if isinstance(quote, dict):
+                    quote_payload = quote.get(exchange_symbol[symbol])
+                    if quote_payload is None and quote:
+                        quote_payload = next(iter(quote.values()), None)
+
+                previous_close = 0.0
+                if isinstance(quote_payload, dict):
+                    ohlc = quote_payload.get("ohlc") or {}
+                    previous_close = float(ohlc.get("close", 0.0) or 0.0)
+
+                timestamp = datetime.now(IST)
+                data = self._broker.get_historical(
+                    str(token),
+                    start,
+                    timestamp,
+                    "1minute",
+                )
+                if not isinstance(data, list):
+                    continue
+
+                completed = self.candle_buffer.get_completed(symbol, 500)
+                live = self.candle_buffer.get_latest(symbol)
+                latest_timestamp = live.timestamp if live is not None else None
+                if latest_timestamp is None and completed:
+                    latest_timestamp = completed[-1].timestamp
+
+                replayed = 0
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+
+                    candle_timestamp = item.get("date") or item.get("datetime")
+                    if candle_timestamp is None:
+                        continue
+
+                    if isinstance(candle_timestamp, str):
+                        candle_timestamp = datetime.fromisoformat(candle_timestamp)
+
+                    if getattr(candle_timestamp, "tzinfo", None) is None:
+                        candle_timestamp = candle_timestamp.replace(tzinfo=IST)
+
+                    candle_timestamp = candle_timestamp.astimezone(IST)
+
+                    if latest_timestamp is not None:
+                        comparable_latest = latest_timestamp
+                        if getattr(comparable_latest, "tzinfo", None) is None:
+                            comparable_latest = comparable_latest.replace(tzinfo=IST)
+                        if candle_timestamp <= comparable_latest:
+                            continue
+
+                    try:
+                        high = float(item["high"])
+                        low = float(item["low"])
+                        open_price = float(item["open"])
+                        close = float(item["close"])
+                        volume = float(item.get("volume", 0.0) or 0.0)
+                    except KeyError, TypeError, ValueError:
+                        continue
+
+                    if previous_close > 0:
+                        self.candle_buffer.sync_broker_day_ohlc(
+                            instrument_id=symbol,
+                            timestamp=candle_timestamp,
+                            open_price=open_price,
+                            high_price=max(high, low),
+                            low_price=min(high, low),
+                            previous_close=previous_close,
+                        )
+
+                    snapshot = MarketSnapshot(
+                        symbol=symbol,
+                        ltp=close,
+                        open=open_price,
+                        high=high,
+                        low=low,
+                        close=close,
+                        volume=volume,
+                        timestamp=candle_timestamp,
+                        market_status=MarketStatus.OPEN,
+                        session="replay",
+                    )
+                    self.candle_buffer.update(snapshot)
+                    replayed += 1
+
+                if replayed:
+                    print(
+                        f"H1V1H2H3 startup replay restored {replayed} candles | {symbol}"
+                    )
+
+                reconciled = list(self.candle_buffer.get_completed(symbol, 500))
+                live = self.candle_buffer.get_latest(symbol)
+                if live is not None:
+                    if not reconciled or reconciled[-1].timestamp != live.timestamp:
+                        reconciled.append(live)
+                if reconciled:
+                    self.h1v1h2h3_detector.reconcile_from_history(symbol, reconciled)
+
+            except Exception:
+                logger.exception("Failed H1V1H2H3 intraday replay for %s", symbol)
+
+    # ========================================================
+    # MAIN
+    # ========================================================
 
 
 def main() -> None:
@@ -2414,7 +2647,3 @@ def main() -> None:
     finally:
         if live_feed is not None:
             live_feed.stop()
-
-
-if __name__ == "__main__":
-    main()

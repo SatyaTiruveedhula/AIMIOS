@@ -591,6 +591,19 @@ class CandleBuffer:
         )
 
         # ----------------------------------------------------
+        # LEGACY PATTERN DETECTOR
+        # ----------------------------------------------------
+
+        if self._pattern_detector is not None:
+            try:
+                completed_candles = list(self._history[instrument_id])
+                patterns = self._pattern_detector.detect(completed_candles)
+                if patterns:
+                    self._publish_pattern(instrument_id, patterns)
+            except Exception:
+                logger.exception("Legacy PatternDetector failed for %s", instrument_id)
+
+        # ----------------------------------------------------
         # NEW DAY EXTREME M/W SENTINEL
         #
         # IMPORTANT:
@@ -1128,11 +1141,11 @@ class CandleBuffer:
 
         if cum_volume > 0.0:
 
-            vwap = cum_price_volume / cum_volume
+            vwap = (high + low + ltp) / 3.0
 
         else:
 
-            vwap = (high + low + ltp) / 3.0
+            vwap = ltp
 
         if ltp > current.open:
 
@@ -1894,3 +1907,178 @@ class CandleBuffer:
         with self._lock:
 
             return self._session_id[instrument_id]
+
+    # ========================================================
+    # EXPORT / IMPORT RUNTIME STATE
+    # ========================================================
+
+    def export_runtime_state(self) -> dict:
+        """Serialize day OHLC, previous close, and intraday candles."""
+        symbols = set(self._history.keys())
+        symbols.update(self._current.keys())
+        symbols.update(self._day_key.keys())
+        symbols.update(self._previous_close.keys())
+
+        candles: Dict[str, List[dict]] = {}
+        current: Dict[str, dict] = {}
+        for symbol in symbols:
+            candle_rows = []
+            for candle in self._history.get(symbol, ()):
+                candle_rows.append(self._candle_to_runtime_row(candle))
+            if candle_rows:
+                candles[symbol] = candle_rows
+
+            live_candle = self._current.get(symbol)
+            if live_candle is not None:
+                current[symbol] = self._candle_to_runtime_row(live_candle)
+
+        return {
+            "symbols": {
+                symbol: {
+                    "day_key": self._day_key.get(symbol),
+                    "day_high": self._day_high.get(symbol),
+                    "day_low": self._day_low.get(symbol),
+                    "broker_synced": bool(self._broker_day_synced.get(symbol, False)),
+                    "previous_close": self._previous_close.get(symbol, 0.0),
+                    "next_candle_id": self._next_candle_id.get(symbol, 0),
+                    "session_id": self._session_id.get(symbol, 1),
+                }
+                for symbol in sorted(symbols)
+            },
+            "candles": candles,
+            "current": current,
+            "last_volume": {
+                symbol: float(volume) for symbol, volume in self._last_volume.items()
+            },
+        }
+
+    def restore_runtime_state(self, payload: Optional[dict]) -> None:
+        """Restore broker OHLC and intraday candle state after restart."""
+        if not isinstance(payload, dict):
+            return
+
+        with self._lock:
+            try:
+                from zoneinfo import ZoneInfo
+
+                today_key = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+            except Exception:
+                today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            active_symbols = set()
+            for symbol, item in payload.get("symbols", {}).items():
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(symbol)
+                day_key = item.get("day_key")
+                if day_key and str(day_key) != today_key:
+                    continue
+                active_symbols.add(symbol)
+
+            for symbol, item in payload.get("symbols", {}).items():
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(symbol)
+                if symbol not in active_symbols:
+                    continue
+                day_key = item.get("day_key")
+                if day_key:
+                    self._day_key[symbol] = str(day_key)
+
+                day_high = item.get("day_high")
+                day_low = item.get("day_low")
+                if day_high is not None:
+                    self._day_high[symbol] = float(day_high)
+                if day_low is not None:
+                    self._day_low[symbol] = float(day_low)
+
+                previous_close = float(item.get("previous_close", 0.0) or 0.0)
+                if previous_close > 0:
+                    self._previous_close[symbol] = previous_close
+
+                self._broker_day_synced[symbol] = bool(item.get("broker_synced", False))
+                self._next_candle_id[symbol] = int(item.get("next_candle_id", 0) or 0)
+                self._session_id[symbol] = int(item.get("session_id", 1) or 1)
+
+            for symbol, rows in payload.get("candles", {}).items():
+                symbol = str(symbol)
+                if symbol not in active_symbols:
+                    continue
+                history = deque(maxlen=self.max_candles)
+                for row in rows:
+                    candle = self._candle_from_runtime_row(row)
+                    if candle is not None:
+                        history.append(candle)
+                self._history[str(symbol)] = history
+
+                self._high_cache[str(symbol)] = deque(
+                    (candle.high for candle in history),
+                    maxlen=self.max_candles,
+                )
+                self._low_cache[str(symbol)] = deque(
+                    (candle.low for candle in history),
+                    maxlen=self.max_candles,
+                )
+
+            for symbol, row in payload.get("current", {}).items():
+                candle = self._candle_from_runtime_row(row)
+                if candle is not None:
+                    self._current[str(symbol)] = candle
+
+            for symbol, volume in payload.get("last_volume", {}).items():
+                try:
+                    self._last_volume[str(symbol)] = float(volume)
+                except TypeError, ValueError:
+                    continue
+
+    @staticmethod
+    def _candle_to_runtime_row(candle: Candle) -> dict:
+        return {
+            "timestamp": candle.timestamp.isoformat(),
+            "open": candle.open,
+            "high": candle.high,
+            "low": candle.low,
+            "close": candle.close,
+            "volume": candle.volume,
+            "previous_close": candle.previous_close,
+            "ticks": candle.ticks,
+            "cum_volume": candle.cum_volume,
+            "cum_price_volume": candle.cum_price_volume,
+            "change_pct": candle.change_pct,
+            "candle_id": candle.candle_id,
+            "body_strength": candle.body_strength,
+            "upper_wick_pct": candle.upper_wick_pct,
+            "lower_wick_pct": candle.lower_wick_pct,
+            "vwap": candle.vwap,
+            "session_id": candle.session_id,
+            "color": candle.color,
+        }
+
+    @staticmethod
+    def _candle_from_runtime_row(row: dict) -> Optional[Candle]:
+        if not isinstance(row, dict):
+            return None
+        try:
+            timestamp = datetime.fromisoformat(str(row["timestamp"]))
+            return Candle(
+                timestamp=timestamp,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row.get("volume", 0.0)),
+                previous_close=float(row.get("previous_close", 0.0)),
+                ticks=int(row.get("ticks", 1)),
+                cum_volume=float(row.get("cum_volume", 0.0)),
+                cum_price_volume=float(row.get("cum_price_volume", 0.0)),
+                change_pct=float(row.get("change_pct", 0.0)),
+                candle_id=int(row.get("candle_id", 0)),
+                body_strength=float(row.get("body_strength", 0.0)),
+                upper_wick_pct=float(row.get("upper_wick_pct", 0.0)),
+                lower_wick_pct=float(row.get("lower_wick_pct", 0.0)),
+                vwap=float(row.get("vwap", 0.0)),
+                session_id=int(row.get("session_id", 1)),
+                color=str(row.get("color", "DOJI")),
+            )
+        except KeyError, TypeError, ValueError:
+            return None

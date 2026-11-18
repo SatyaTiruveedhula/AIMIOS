@@ -121,7 +121,7 @@ class H1V1H2H3Detector:
                     previous_close = float(previous_close)
                     if previous_close > 0:
                         return previous_close
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     pass
 
         first = sorted_history[0]
@@ -130,7 +130,7 @@ class H1V1H2H3Detector:
                 opening_price = float(first.open)
                 if opening_price > 0:
                     return opening_price
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 pass
         return (float(first.high) + float(first.low)) / 2.0
 
@@ -623,4 +623,199 @@ class H1V1H2H3Detector:
             "v1": v1,
             "h2": h2,
             "h3": None,
+        }
+
+    def export_state(self) -> Dict[str, Any]:
+        """Serialize detector state for process restart persistence."""
+        daily_state: Dict[str, Any] = {}
+        for day_key, state in self._daily_state.items():
+            daily_state[day_key] = {
+                "reference_open": state.reference_open,
+                "trigger_direction": state.trigger_direction,
+                "trigger_timestamp": (
+                    state.trigger_timestamp.isoformat()
+                    if state.trigger_timestamp is not None
+                    else None
+                ),
+                "h1": state.h1,
+                "h1_timestamp": (
+                    state.h1_timestamp.isoformat()
+                    if state.h1_timestamp is not None
+                    else None
+                ),
+                "v1": state.v1,
+                "v1_timestamp": (
+                    state.v1_timestamp.isoformat()
+                    if state.v1_timestamp is not None
+                    else None
+                ),
+                "h2": state.h2,
+                "h2_timestamp": (
+                    state.h2_timestamp.isoformat()
+                    if state.h2_timestamp is not None
+                    else None
+                ),
+                "h3": state.h3,
+                "h3_timestamp": (
+                    state.h3_timestamp.isoformat()
+                    if state.h3_timestamp is not None
+                    else None
+                ),
+            }
+
+        return {
+            "daily_state": daily_state,
+            "daily_alerts": {
+                day_key: sorted(alerted)
+                for day_key, alerted in self._daily_alerts.items()
+            },
+        }
+
+    def restore_state(self, payload: Optional[Dict[str, Any]]) -> None:
+        """Restore detector state from a same-day runtime snapshot."""
+        if not isinstance(payload, dict):
+            return
+
+        today = None
+        if payload:
+            for day_key in payload.get("daily_state", {}):
+                today = day_key
+
+        if today is None:
+            return
+
+        if INDIA_TZ is not None:
+            current_day = datetime.now(INDIA_TZ).date().isoformat()
+        else:
+            current_day = datetime.now().date().isoformat()
+
+        for day_key, item in payload.get("daily_state", {}).items():
+            if not isinstance(item, dict):
+                continue
+            if not str(day_key).endswith(current_day):
+                continue
+
+            state = _H1V1H2H3State(
+                reference_open=item.get("reference_open"),
+                trigger_direction=item.get("trigger_direction"),
+                trigger_timestamp=self._parse_saved_datetime(
+                    item.get("trigger_timestamp")
+                ),
+                h1=item.get("h1"),
+                h1_timestamp=self._parse_saved_datetime(item.get("h1_timestamp")),
+                v1=item.get("v1"),
+                v1_timestamp=self._parse_saved_datetime(item.get("v1_timestamp")),
+                h2=item.get("h2"),
+                h2_timestamp=self._parse_saved_datetime(item.get("h2_timestamp")),
+                h3=item.get("h3"),
+                h3_timestamp=self._parse_saved_datetime(item.get("h3_timestamp")),
+            )
+            self._daily_state[day_key] = state
+
+        for day_key, alerted in payload.get("daily_alerts", {}).items():
+            self._daily_alerts[day_key] = set(
+                alerted if isinstance(alerted, list) else []
+            )
+
+    def reconcile_from_history(
+        self,
+        symbol: str,
+        candles: Iterable[Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Rebuild and extend the active pattern from preserved OHLC history."""
+        sorted_history = self._sorted_history(candles)
+        if not sorted_history:
+            return None
+
+        candle_dt = self._normalize_datetime(sorted_history[-1].timestamp)
+        day_key = self._day_key(symbol, candle_dt)
+        state = self._ensure_state(symbol, sorted_history[-1])
+
+        reference_open = self._reference_open(sorted_history)
+        if reference_open > 0:
+            state.reference_open = reference_open
+
+        if state.reference_open is None:
+            return None
+
+        ref = float(state.reference_open)
+        up_candidates = [
+            item for item in sorted_history if float(item.high) >= ref * 1.005
+        ]
+        down_candidates = [
+            item for item in sorted_history if float(item.low) <= ref * 0.995
+        ]
+
+        if not up_candidates and not down_candidates:
+            state.trigger_direction = None
+            state.trigger_timestamp = None
+            state.h1 = state.v1 = state.h2 = state.h3 = None
+            state.h1_timestamp = state.v1_timestamp = None
+            state.h2_timestamp = state.h3_timestamp = None
+            return None
+
+        if up_candidates and not down_candidates:
+            direction = "up"
+            trigger_timestamp = min(
+                self._normalize_datetime(item.timestamp) for item in up_candidates
+            )
+        elif down_candidates and not up_candidates:
+            direction = "down"
+            trigger_timestamp = min(
+                self._normalize_datetime(item.timestamp) for item in down_candidates
+            )
+        else:
+            up_timestamp = min(
+                self._normalize_datetime(item.timestamp) for item in up_candidates
+            )
+            down_timestamp = min(
+                self._normalize_datetime(item.timestamp) for item in down_candidates
+            )
+            direction = "up" if up_timestamp <= down_timestamp else "down"
+            trigger_timestamp = min(up_timestamp, down_timestamp)
+
+        state.trigger_direction = direction
+        state.trigger_timestamp = trigger_timestamp
+
+        # Recompute every stage from the beginning of the trigger after restart.
+        # This allows H1 and later points to adjust as newly restored OHLC
+        # candles extend or replace the in-progress pattern.
+        state.h1 = None
+        state.h1_timestamp = None
+        state.v1 = None
+        state.v1_timestamp = None
+        state.h2 = None
+        state.h2_timestamp = None
+        state.h3 = None
+        state.h3_timestamp = None
+
+        direction_key = "up" if direction == "up" else "down"
+        setup = self._pattern_for_direction(
+            sorted_history,
+            trigger_timestamp,
+            direction_key,
+        )
+
+        if setup is not None:
+            state.h1 = float(setup["h1"])
+            state.h1_timestamp = setup["h1_ts"]
+            state.v1 = float(setup["v1"])
+            state.v1_timestamp = setup["v1_ts"]
+            state.h2 = float(setup["h2"])
+            state.h2_timestamp = setup["h2_ts"]
+            state.h3 = float(setup["h3"])
+            state.h3_timestamp = setup["h3_ts"]
+        else:
+            partial = self.get_setup_status(symbol, sorted_history[-1], sorted_history)
+            if partial is not None:
+                state.h1 = partial["h1"]
+                state.v1 = partial["v1"]
+                state.h2 = partial["h2"]
+
+        return {
+            "direction": state.trigger_direction,
+            "h1": state.h1,
+            "v1": state.v1,
+            "h2": state.h2,
+            "h3": state.h3,
         }

@@ -222,3 +222,122 @@ def test_h1_v1_h2_h3_uses_previous_close_for_trigger() -> None:
         alerts.extend(detector.process_candle("SENSEX", candle, candles[: index + 1]))
 
     assert any(alert["direction"] == "PE" for alert in alerts)
+
+
+def test_h1v1h2h3_state_round_trip_preserves_trigger_and_previous_close() -> None:
+    previous_close = 82532.19
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+
+    candles = [
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:15", "%H:%M").time(),
+            open=82376.56,
+            high=82390.0,
+            low=82250.0,
+            close=82300.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:20", "%H:%M").time(),
+            open=82250.0,
+            high=82270.0,
+            low=82050.0,
+            close=82080.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:25", "%H:%M").time(),
+            open=82050.0,
+            high=82220.0,
+            low=81840.0,
+            close=81900.0,
+            previous_close=previous_close,
+        ),
+    ]
+
+    detector.process_candle("SENSEX", candles[-1], candles)
+    snapshot = detector.export_state()
+
+    restored = H1V1H2H3Detector(min_wait_minutes=0)
+    restored.restore_state(snapshot)
+
+    for day_key, state in restored._daily_state.items():
+        assert day_key.startswith("SENSEX:")
+        assert state.reference_open == previous_close
+        assert state.trigger_direction in {"up", "down"}
+
+
+def test_candle_buffer_runtime_state_round_trip_preserves_previous_close_and_history() -> (
+    None
+):
+    from datetime import timezone
+    from aimios.market.candle_buffer import CandleBuffer
+    from aimios.market.market_snapshot import MarketSnapshot, MarketStatus
+
+    buffer = CandleBuffer(max_candles=500, timeframe=60)
+    timestamp = datetime(2026, 11, 18, 9, 15, tzinfo=timezone.utc)
+    buffer.sync_broker_day_ohlc(
+        "SENSEX",
+        timestamp,
+        82376.56,
+        82578.87,
+        81780.47,
+        82532.19,
+    )
+    buffer.update(
+        MarketSnapshot(
+            symbol="SENSEX",
+            ltp=82390.0,
+            open=82376.56,
+            high=82390.0,
+            low=82250.0,
+            close=82390.0,
+            volume=100,
+            timestamp=timestamp,
+            market_status=MarketStatus.OPEN,
+            session="live",
+        )
+    )
+
+    snapshot = buffer.export_runtime_state()
+    restored = CandleBuffer(max_candles=500, timeframe=60)
+    restored.restore_runtime_state(snapshot)
+
+    assert restored._previous_close["SENSEX"] == 82532.19
+    assert restored._day_high["SENSEX"] == 82578.87
+    assert restored._day_low["SENSEX"] == 81780.47
+    assert restored.get_latest("SENSEX") is not None
+
+
+def test_h1v1h2h3_reconciles_and_extends_restored_ohlc_history() -> None:
+    previous_close = 82532.19
+
+    def candle(ts: str, high: float, low: float) -> SimpleNamespace:
+        return SimpleNamespace(
+            timestamp=datetime.strptime(ts, "%H:%M").time(),
+            open=previous_close,
+            high=high,
+            low=low,
+            close=(high + low) / 2,
+            previous_close=previous_close,
+        )
+
+    restored_history = [
+        candle("09:15", 82390.0, 82250.0),
+        candle("09:20", 82270.0, 82050.0),
+        candle("09:25", 82140.0, 81840.0),
+        candle("09:30", 82220.0, 81900.0),
+    ]
+
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+    setup = detector.reconcile_from_history("SENSEX", restored_history)
+    assert setup is not None
+
+    first_h1 = setup["h1"]
+
+    restored_history.append(candle("09:35", 82080.0, 81790.0))
+    setup = detector.reconcile_from_history("SENSEX", restored_history)
+
+    assert setup is not None
+    assert setup["direction"] == "down"
+    assert setup["h1"] == 81790.0
