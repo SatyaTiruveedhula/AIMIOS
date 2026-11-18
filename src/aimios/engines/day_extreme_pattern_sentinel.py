@@ -653,33 +653,7 @@ class DayExtremePatternSentinel:
 
                     setup.waiting_printed = True
 
-                    logger.info(
-                        "M SETUP CONFIRMED | "
-                        "symbol=%s | "
-                        "HIGH1=%.2f | "
-                        "VALLEY=%.2f | "
-                        "REVERSAL=%.3f%% | "
-                        "WAITING FOR HIGH2 | "
-                        "MIN_CANDLES=%d | "
-                        "REQUIRED_HIGH2_DIFF=%.3f%%",
-                        symbol,
-                        setup.high1,
-                        setup.valley,
-                        fall_pct,
-                        self.min_candles_between_extremes,
-                        self.min_second_swing_difference_pct,
-                    )
-
-                    print(
-                        f"M SETUP CONFIRMED | "
-                        f"{symbol} | "
-                        f"HIGH1={setup.high1:.2f} | "
-                        f"VALLEY={setup.valley:.2f} | "
-                        f"REVERSAL={fall_pct:.3f}% | "
-                        f"WAITING FOR HIGH2"
-                    )
-
-            return None
+        return None
 
         # ====================================================
         # EXTEND VALLEY
@@ -924,33 +898,7 @@ class DayExtremePatternSentinel:
 
                     setup.waiting_printed = True
 
-                    logger.info(
-                        "W SETUP CONFIRMED | "
-                        "symbol=%s | "
-                        "LOW1=%.2f | "
-                        "PEAK=%.2f | "
-                        "REVERSAL=%.3f%% | "
-                        "WAITING FOR LOW2 | "
-                        "MIN_CANDLES=%d | "
-                        "REQUIRED_LOW2_DIFF=%.3f%%",
-                        symbol,
-                        setup.low1,
-                        setup.peak,
-                        rise_pct,
-                        self.min_candles_between_extremes,
-                        self.min_second_swing_difference_pct,
-                    )
-
-                    print(
-                        f"W SETUP CONFIRMED | "
-                        f"{symbol} | "
-                        f"LOW1={setup.low1:.2f} | "
-                        f"PEAK={setup.peak:.2f} | "
-                        f"REVERSAL={rise_pct:.3f}% | "
-                        f"WAITING FOR LOW2"
-                    )
-
-            return None
+        return None
 
         # ====================================================
         # EXTEND PEAK
@@ -1064,18 +1012,6 @@ class DayExtremePatternSentinel:
         )
 
         self._register_signal(symbol, "BUY", alert)
-
-        print(
-            f"W ALERT | "
-            f"{symbol} | "
-            f"BUY | "
-            f"LOW1={setup.low1:.2f} | "
-            f"PEAK={setup.peak:.2f} | "
-            f"LOW2={candle_low:.2f} | "
-            f"REVERSAL={((setup.peak - setup.low1) / setup.low1) * 100.0:.3f}% | "
-            f"LOW1-LOW2={difference_pct:.3f}% | "
-            f"CANDLES={candles_distance}"
-        )
 
         self._w_setup.pop(
             symbol,

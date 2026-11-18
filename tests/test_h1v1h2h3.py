@@ -135,7 +135,7 @@ def test_h1_v1_h2_h3_logs_only_final_alert_not_prepare_messages(
     assert calls
 
 
-def test_live_feed_prints_snapshot_when_day_high_or_low_changes(capsys) -> None:
+def test_live_feed_does_not_repeat_snapshot_after_startup(capsys) -> None:
     feed = KiteLiveFeed.__new__(KiteLiveFeed)
     feed._last_snapshots = {
         "SENSEX": SimpleNamespace(
@@ -165,6 +165,4 @@ def test_live_feed_prints_snapshot_when_day_high_or_low_changes(capsys) -> None:
     feed._maybe_print_snapshots()
 
     captured = capsys.readouterr().out
-    assert "COMPLETE MARKET SNAPSHOT" in captured
-    assert "HIGH=82,100.00" in captured
-    assert "LOW=81,710.00" in captured
+    assert captured == ""

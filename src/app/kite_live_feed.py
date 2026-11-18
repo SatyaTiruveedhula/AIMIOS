@@ -264,7 +264,7 @@ class KiteLiveFeed:
         ] = {}
 
         self._last_snapshot_print_ltp: Dict[str, float] = {}
-        self._snapshot_move_threshold = 0.5
+        self._snapshot_move_threshold_pct = 0.5
 
         self._last_health_print = 0.0
 
@@ -985,40 +985,12 @@ class KiteLiveFeed:
         if not self._last_snapshots:
             return
 
-        if not self._snapshot_printed_initial:
-            self._snapshot_printed_initial = True
-
-            for instrument_id, snapshot in self._last_snapshots.items():
-                try:
-                    ltp = float(snapshot.ltp)
-                    self._last_snapshot_print_ltp[instrument_id] = ltp
-                    self._last_high_low_print[instrument_id] = (
-                        float(snapshot.high),
-                        float(snapshot.low),
-                    )
-                except AttributeError, TypeError, ValueError:
-                    pass
-
-            self._print_complete_market_snapshot()
-            self._last_15min_snapshot_epoch = time.time()
+        if self._snapshot_printed_initial:
             return
 
-        for instrument_id, snapshot in sorted(
-            self._last_snapshots.items(), key=lambda item: item[0]
-        ):
-            try:
-                current_ltp = float(snapshot.ltp)
-            except AttributeError, TypeError, ValueError:
-                continue
+        self._snapshot_printed_initial = True
 
-            previous_ltp = self._last_snapshot_print_ltp.get(instrument_id)
-
-            if previous_ltp is not None:
-                if abs(current_ltp - previous_ltp) < self._snapshot_move_threshold:
-                    continue
-
-            self._last_snapshot_print_ltp[instrument_id] = current_ltp
-
+        for instrument_id, snapshot in self._last_snapshots.items():
             try:
                 self._last_high_low_print[instrument_id] = (
                     float(snapshot.high),
@@ -1027,7 +999,8 @@ class KiteLiveFeed:
             except AttributeError, TypeError, ValueError:
                 pass
 
-            self._print_changed_market_snapshot(instrument_id, snapshot)
+        self._print_complete_market_snapshot()
+        self._last_15min_snapshot_epoch = time.time()
 
     # ========================================================
     # STOP
@@ -1671,9 +1644,14 @@ class KiteLiveFeed:
         # ACTUAL DAY EXTREME ALERT
         # ----------------------------------------------------
 
+        play_pattern_alert_beep()
+
         print("")
+
         print("=" * 60)
+
         print("AIMIOS DAY EXTREME ALERT")
+
         print("=" * 60)
 
         print(f"TIME       : {timestamp}")
@@ -2316,7 +2294,10 @@ class KiteLiveFeed:
 
         timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
+        play_pattern_alert_beep()
+
         print("")
+
         print("-" * 60)
 
         print(f"TIME       : {timestamp}")
@@ -2411,52 +2392,29 @@ class KiteLiveFeed:
 
 
 def main() -> None:
-
     live_feed: Optional[KiteLiveFeed] = None
 
-    def handle_shutdown(
-        signum,
-        frame,
-    ) -> None:
-
+    def handle_shutdown(signum, frame) -> None:
         print("")
         print("Shutdown signal received.")
-
         if live_feed is not None:
-
             live_feed.stop()
 
-    signal.signal(
-        signal.SIGINT,
-        handle_shutdown,
-    )
-
-    signal.signal(
-        signal.SIGTERM,
-        handle_shutdown,
-    )
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
     live_feed = KiteLiveFeed()
 
     try:
-
         live_feed.start()
-
     except KeyboardInterrupt:
-
         print("Keyboard interrupt received.")
-
     except Exception:
-
         logger.exception("KiteLiveFeed failed")
-
     finally:
-
         if live_feed is not None:
-
             live_feed.stop()
 
 
 if __name__ == "__main__":
-
     main()

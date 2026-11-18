@@ -291,13 +291,13 @@ def test_signal_cooling_alert_emits_once_per_cycle(capsys) -> None:
     assert "SELL SIGNAL LOST STRENGTH" in sell_output
 
 
-def test_live_feed_alerts_only_sensex() -> None:
+def test_live_feed_tracks_configured_indices() -> None:
     feed = KiteLiveFeed(instrument_ids=["NIFTY", "BANKNIFTY", "SENSEX"])
 
-    assert feed.instrument_ids == ["SENSEX"]
+    assert feed.instrument_ids == ["NIFTY", "BANKNIFTY", "SENSEX"]
     assert feed._is_active_alert_symbol("SENSEX") is True
-    assert feed._is_active_alert_symbol("NIFTY") is False
-    assert feed._is_active_alert_symbol("BANKNIFTY") is False
+    assert feed._is_active_alert_symbol("NIFTY") is True
+    assert feed._is_active_alert_symbol("BANKNIFTY") is True
 
 
 def test_verdict_analysis_distinguishes_close_bad_from_active_useful_signal() -> None:
