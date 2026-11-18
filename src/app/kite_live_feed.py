@@ -2647,3 +2647,7 @@ def main() -> None:
     finally:
         if live_feed is not None:
             live_feed.stop()
+
+
+if __name__ == "__main__":
+    main()
