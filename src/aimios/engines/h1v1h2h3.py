@@ -111,9 +111,27 @@ class H1V1H2H3Detector:
     def _reference_open(self, sorted_history: List[Any]) -> float:
         if not sorted_history:
             return 0.0
+
+        # Broker candles expose previous_close; it is the required baseline
+        # for the +/-0.5% trigger. Prefer it over the opening price.
+        for candle in sorted_history:
+            previous_close = getattr(candle, "previous_close", None)
+            if previous_close is not None:
+                try:
+                    previous_close = float(previous_close)
+                    if previous_close > 0:
+                        return previous_close
+                except (TypeError, ValueError):
+                    pass
+
         first = sorted_history[0]
         if hasattr(first, "open") and first.open is not None:
-            return float(first.open)
+            try:
+                opening_price = float(first.open)
+                if opening_price > 0:
+                    return opening_price
+            except (TypeError, ValueError):
+                pass
         return (float(first.high) + float(first.low)) / 2.0
 
     def _reset_state(self, state: _H1V1H2H3State) -> None:

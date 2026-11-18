@@ -166,3 +166,59 @@ def test_live_feed_does_not_repeat_snapshot_after_startup(capsys) -> None:
 
     captured = capsys.readouterr().out
     assert captured == ""
+
+
+def test_h1_v1_h2_h3_uses_previous_close_for_trigger() -> None:
+    previous_close = 82532.19
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+
+    candles = [
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:15", "%H:%M").time(),
+            open=82376.56,
+            high=82390.0,
+            low=82250.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:20", "%H:%M").time(),
+            open=82250.0,
+            high=82270.0,
+            low=82050.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:25", "%H:%M").time(),
+            open=82050.0,
+            high=82220.0,
+            low=81840.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:30", "%H:%M").time(),
+            open=81840.0,
+            high=82140.0,
+            low=81900.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:35", "%H:%M").time(),
+            open=81900.0,
+            high=82220.0,
+            low=81950.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:40", "%H:%M").time(),
+            open=82220.0,
+            high=82320.0,
+            low=82100.0,
+            previous_close=previous_close,
+        ),
+    ]
+
+    alerts = []
+    for index, candle in enumerate(candles):
+        alerts.extend(detector.process_candle("SENSEX", candle, candles[: index + 1]))
+
+    assert any(alert["direction"] == "PE" for alert in alerts)

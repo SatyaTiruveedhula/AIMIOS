@@ -141,6 +141,7 @@ class CandleBuffer:
         self._day_high: Dict[str, float] = {}
         self._day_low: Dict[str, float] = {}
         self._broker_day_synced: Dict[str, bool] = {}
+        self._previous_close: Dict[str, float] = {}
 
         # ----------------------------------------------------
         # CANDLE IDS
@@ -318,6 +319,7 @@ class CandleBuffer:
                 )
 
                 self._broker_day_synced[instrument_id] = False
+                self._previous_close.pop(instrument_id, None)
 
                 # Reset Day Extreme Sentinel for new day.
                 if self._day_extreme_sentinel is not None:
@@ -338,6 +340,9 @@ class CandleBuffer:
 
             self._day_high[instrument_id] = high_price
             self._day_low[instrument_id] = low_price
+
+            if previous_close > 0:
+                self._previous_close[instrument_id] = float(previous_close)
 
             self._broker_day_synced[instrument_id] = True
 
@@ -820,6 +825,7 @@ class CandleBuffer:
             )
 
             self._broker_day_synced[instrument_id] = False
+            self._previous_close.pop(instrument_id, None)
 
             if self._day_extreme_sentinel is not None:
 
@@ -1169,6 +1175,10 @@ class CandleBuffer:
         self,
         instrument_id: str,
     ) -> float:
+
+        broker_previous_close = self._previous_close.get(instrument_id, 0.0)
+        if broker_previous_close > 0:
+            return broker_previous_close
 
         history = self._history[instrument_id]
 
@@ -1663,6 +1673,7 @@ class CandleBuffer:
                 self._day_high.clear()
                 self._day_low.clear()
                 self._broker_day_synced.clear()
+                self._previous_close.clear()
                 self._next_candle_id.clear()
                 self._session_id.clear()
 
@@ -1718,6 +1729,11 @@ class CandleBuffer:
             )
 
             self._broker_day_synced.pop(
+                instrument_id,
+                None,
+            )
+
+            self._previous_close.pop(
                 instrument_id,
                 None,
             )
@@ -1787,6 +1803,11 @@ class CandleBuffer:
                         None,
                     )
 
+                    self._previous_close.pop(
+                        symbol,
+                        None,
+                    )
+
                     if self._day_extreme_sentinel is not None:
 
                         try:
@@ -1828,6 +1849,21 @@ class CandleBuffer:
             )
 
             self._broker_day_synced.pop(
+                instrument_id,
+                None,
+            )
+
+            self._previous_close.pop(
+                instrument_id,
+                None,
+            )
+
+            self._next_candle_id.pop(
+                instrument_id,
+                None,
+            )
+
+            self._session_id.pop(
                 instrument_id,
                 None,
             )
