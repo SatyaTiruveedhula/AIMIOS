@@ -1,7 +1,7 @@
 [
     {
         "symbol": "NIFTY",
-        "trigger_price": 25500.0,
+        "trigger_price": 25360.0,
         "direction": "up",
         "label": "manual target",
         "enabled": true

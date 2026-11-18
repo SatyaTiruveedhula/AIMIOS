@@ -433,3 +433,176 @@ class H1V1H2H3Detector:
 
         self._daily_alerts[day_key] = alerted_today
         return alerts
+
+    def get_setup_status(
+        self,
+        symbol: str,
+        candle: Any,
+        candles: Iterable[Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Return current partial H1V1H2H3 setup values for silent progress output."""
+        if candle is None:
+            return None
+
+        candle_dt = self._normalize_datetime(candle.timestamp)
+        state = self._ensure_state(symbol, candle)
+        sorted_history = self._sorted_history(candles)
+        if not sorted_history:
+            return None
+
+        if state.reference_open is None:
+            state.reference_open = self._reference_open(sorted_history)
+
+        if state.trigger_direction is None:
+            ref = float(state.reference_open)
+            trigger_up = any(float(item.high) >= ref * 1.005 for item in sorted_history)
+            trigger_down = any(
+                float(item.low) <= ref * 0.995 for item in sorted_history
+            )
+            if not trigger_up and not trigger_down:
+                return None
+
+            if trigger_up and not trigger_down:
+                state.trigger_direction = "up"
+            elif trigger_down and not trigger_up:
+                state.trigger_direction = "down"
+            else:
+                up_ts = min(
+                    self._normalize_datetime(item.timestamp)
+                    for item in sorted_history
+                    if float(item.high) >= ref * 1.005
+                )
+                down_ts = min(
+                    self._normalize_datetime(item.timestamp)
+                    for item in sorted_history
+                    if float(item.low) <= ref * 0.995
+                )
+                state.trigger_direction = "up" if up_ts <= down_ts else "down"
+
+            state.trigger_timestamp = min(
+                self._normalize_datetime(item.timestamp)
+                for item in sorted_history
+                if (
+                    (
+                        state.trigger_direction == "up"
+                        and float(item.high) >= ref * 1.005
+                    )
+                    or (
+                        state.trigger_direction == "down"
+                        and float(item.low) <= ref * 0.995
+                    )
+                )
+            )
+
+        ref = float(state.reference_open)
+        trigger_timestamp = state.trigger_timestamp
+        if trigger_timestamp is None:
+            return None
+
+        v1_gap = ref * self.h1_v1_drop_pct
+        h2_gap = ref * self.h1_h2_upper_pct
+
+        if state.trigger_direction == "up":
+            h1_candidates = [
+                item
+                for item in sorted_history
+                if self._normalize_datetime(item.timestamp) >= trigger_timestamp
+            ]
+            h1 = (
+                max(float(item.high) for item in h1_candidates)
+                if h1_candidates
+                else None
+            )
+            h1_ts = None
+            if h1 is not None:
+                h1_ts = min(
+                    self._normalize_datetime(item.timestamp)
+                    for item in h1_candidates
+                    if float(item.high) == h1
+                )
+
+            v1 = None
+            v1_ts = None
+            if h1_ts is not None:
+                v1_candidates = [
+                    item
+                    for item in sorted_history
+                    if self._normalize_datetime(item.timestamp) >= h1_ts
+                    and float(item.low) < h1 - v1_gap
+                ]
+                if v1_candidates:
+                    v1 = min(float(item.low) for item in v1_candidates)
+                    v1_ts = min(
+                        self._normalize_datetime(item.timestamp)
+                        for item in v1_candidates
+                        if float(item.low) == v1
+                    )
+
+            h2 = None
+            if v1 is not None and v1_ts is not None:
+                h2_candidates = [
+                    item
+                    for item in sorted_history
+                    if self._normalize_datetime(item.timestamp) >= v1_ts
+                    and float(item.high) > v1
+                    and float(item.high) < h1
+                    and float(item.high) >= h1 - h2_gap
+                ]
+                if h2_candidates:
+                    h2 = max(float(item.high) for item in h2_candidates)
+        else:
+            h1_candidates = [
+                item
+                for item in sorted_history
+                if self._normalize_datetime(item.timestamp) >= trigger_timestamp
+            ]
+            h1 = (
+                min(float(item.low) for item in h1_candidates)
+                if h1_candidates
+                else None
+            )
+            h1_ts = None
+            if h1 is not None:
+                h1_ts = min(
+                    self._normalize_datetime(item.timestamp)
+                    for item in h1_candidates
+                    if float(item.low) == h1
+                )
+
+            v1 = None
+            v1_ts = None
+            if h1_ts is not None:
+                v1_candidates = [
+                    item
+                    for item in sorted_history
+                    if self._normalize_datetime(item.timestamp) >= h1_ts
+                    and float(item.high) > h1 + v1_gap
+                ]
+                if v1_candidates:
+                    v1 = max(float(item.high) for item in v1_candidates)
+                    v1_ts = min(
+                        self._normalize_datetime(item.timestamp)
+                        for item in v1_candidates
+                        if float(item.high) == v1
+                    )
+
+            h2 = None
+            if v1 is not None and v1_ts is not None:
+                h2_candidates = [
+                    item
+                    for item in sorted_history
+                    if self._normalize_datetime(item.timestamp) >= v1_ts
+                    and float(item.low) < v1
+                    and float(item.low) > h1
+                    and float(item.low) <= h1 + h2_gap
+                ]
+                if h2_candidates:
+                    h2 = min(float(item.low) for item in h2_candidates)
+
+        return {
+            "direction": state.trigger_direction,
+            "h1": h1,
+            "v1": v1,
+            "h2": h2,
+            "h3": None,
+        }
