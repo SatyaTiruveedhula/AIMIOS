@@ -263,6 +263,9 @@ class KiteLiveFeed:
             tuple[float, float],
         ] = {}
 
+        self._last_snapshot_print_ltp: Dict[str, float] = {}
+        self._snapshot_move_threshold = 0.5
+
         self._last_health_print = 0.0
 
         self._snapshot_printed_initial = False
@@ -951,6 +954,30 @@ class KiteLiveFeed:
         print("=" * 80)
         print("")
 
+    def _print_changed_market_snapshot(
+        self,
+        instrument_id: str,
+        snapshot: MarketSnapshot,
+    ) -> None:
+        print("")
+        print("=" * 80)
+        print(f"MARKET MOVE | {instrument_id}")
+        print("=" * 80)
+        print(
+            f"{instrument_id:>12} | "
+            f"LTP={snapshot.ltp:,.2f} | "
+            f"OPEN={snapshot.open:,.2f} | "
+            f"HIGH={snapshot.high:,.2f} | "
+            f"LOW={snapshot.low:,.2f} | "
+            f"CLOSE={snapshot.close:,.2f} | "
+            f"VOL={snapshot.volume:,.0f} | "
+            f"TIME={snapshot.timestamp.astimezone(IST).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        watch_status = self._build_instrument_watch_status(instrument_id)
+        print(f"{instrument_id:>12} | {watch_status}")
+        print("=" * 80)
+        print("")
+
     def _maybe_print_snapshots(
         self,
     ) -> None:
@@ -960,31 +987,47 @@ class KiteLiveFeed:
 
         if not self._snapshot_printed_initial:
             self._snapshot_printed_initial = True
+
             for instrument_id, snapshot in self._last_snapshots.items():
                 try:
+                    ltp = float(snapshot.ltp)
+                    self._last_snapshot_print_ltp[instrument_id] = ltp
                     self._last_high_low_print[instrument_id] = (
                         float(snapshot.high),
                         float(snapshot.low),
                     )
-                except AttributeError:
+                except AttributeError, TypeError, ValueError:
                     pass
+
             self._print_complete_market_snapshot()
             self._last_15min_snapshot_epoch = time.time()
             return
 
-        for instrument_id, snapshot in self._last_snapshots.items():
+        for instrument_id, snapshot in sorted(
+            self._last_snapshots.items(), key=lambda item: item[0]
+        ):
             try:
-                current_high_low = (float(snapshot.high), float(snapshot.low))
+                current_ltp = float(snapshot.ltp)
             except AttributeError, TypeError, ValueError:
                 continue
 
-            previous_high_low = self._last_high_low_print.get(instrument_id)
-            if previous_high_low is None or previous_high_low != current_high_low:
-                self._last_high_low_print[instrument_id] = current_high_low
-                self._print_complete_market_snapshot()
-                return
+            previous_ltp = self._last_snapshot_print_ltp.get(instrument_id)
 
-        return
+            if previous_ltp is not None:
+                if abs(current_ltp - previous_ltp) < self._snapshot_move_threshold:
+                    continue
+
+            self._last_snapshot_print_ltp[instrument_id] = current_ltp
+
+            try:
+                self._last_high_low_print[instrument_id] = (
+                    float(snapshot.high),
+                    float(snapshot.low),
+                )
+            except AttributeError, TypeError, ValueError:
+                pass
+
+            self._print_changed_market_snapshot(instrument_id, snapshot)
 
     # ========================================================
     # STOP
