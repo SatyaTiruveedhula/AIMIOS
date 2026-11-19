@@ -427,3 +427,28 @@ def test_initial_ce_trigger_allows_later_pe_pattern_without_second_trigger() -> 
         alerts.extend(detector.process_candle("NIFTY", candle, candles[: index + 1]))
 
     assert [alert["direction"] for alert in alerts] == ["CE", "PE"]
+
+
+def test_h1v1h2h3_restore_state_rebuilds_saved_timestamps() -> None:
+    from zoneinfo import ZoneInfo
+
+    india_tz = ZoneInfo("Asia/Kolkata")
+    now = datetime.now(india_tz).replace(hour=9, minute=15, second=0, microsecond=0)
+    previous_close = 82532.19
+    candle = SimpleNamespace(
+        timestamp=now,
+        open=82376.56,
+        high=82390.0,
+        low=82050.0,
+        close=82100.0,
+        previous_close=previous_close,
+    )
+
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+    detector.process_candle("SENSEX", candle, [candle])
+    snapshot = detector.export_state()
+
+    restored = H1V1H2H3Detector(min_wait_minutes=0)
+    restored.restore_state(snapshot)
+
+    assert restored.export_state()["daily_state"]

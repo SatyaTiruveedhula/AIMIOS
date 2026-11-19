@@ -1,0 +1,66 @@
+[1mdiff --git a/src/aimios/market/candle_buffer.py b/src/aimios/market/candle_buffer.py[m
+[1mindex 7fcd981..1ca8382 100644[m
+[1m--- a/src/aimios/market/candle_buffer.py[m
+[1m+++ b/src/aimios/market/candle_buffer.py[m
+[36m@@ -319,6 +319,7 @@[m [mclass CandleBuffer:[m
+                 )[m
+ [m
+                 self._broker_day_synced[instrument_id] = False[m
+[32m+[m[32m                self._previous_close.pop(instrument_id, None)[m
+ [m
+                 # Reset Day Extreme Sentinel for new day.[m
+                 if self._day_extreme_sentinel is not None:[m
+[36m@@ -824,6 +825,7 @@[m [mclass CandleBuffer:[m
+             )[m
+ [m
+             self._broker_day_synced[instrument_id] = False[m
+[32m+[m[32m            self._previous_close.pop(instrument_id, None)[m
+ [m
+             if self._day_extreme_sentinel is not None:[m
+ [m
+[36m@@ -1731,6 +1733,11 @@[m [mclass CandleBuffer:[m
+                 None,[m
+             )[m
+ [m
+[32m+[m[32m            self._previous_close.pop([m
+[32m+[m[32m                instrument_id,[m
+[32m+[m[32m                None,[m
+[32m+[m[32m            )[m
+[32m+[m
+             self._next_candle_id.pop([m
+                 instrument_id,[m
+                 None,[m
+[36m@@ -1796,6 +1803,11 @@[m [mclass CandleBuffer:[m
+                         None,[m
+                     )[m
+ [m
+[32m+[m[32m                    self._previous_close.pop([m
+[32m+[m[32m                        symbol,[m
+[32m+[m[32m                        None,[m
+[32m+[m[32m                    )[m
+[32m+[m
+                     if self._day_extreme_sentinel is not None:[m
+ [m
+                         try:[m
+[36m@@ -1841,6 +1853,21 @@[m [mclass CandleBuffer:[m
+                 None,[m
+             )[m
+ [m
+[32m+[m[32m            self._previous_close.pop([m
+[32m+[m[32m                instrument_id,[m
+[32m+[m[32m                None,[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            self._next_candle_id.pop([m
+[32m+[m[32m                instrument_id,[m
+[32m+[m[32m                None,[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            self._session_id.pop([m
+[32m+[m[32m                instrument_id,[m
+[32m+[m[32m                None,[m
+[32m+[m[32m            )[m
+[32m+[m
+             if self._day_extreme_sentinel is not None:[m
+ [m
+                 try:[m

@@ -752,6 +752,15 @@ class H1V1H2H3Detector:
                 alerted if isinstance(alerted, list) else []
             )
 
+    @staticmethod
+    def _parse_saved_datetime(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        try:
+            return H1V1H2H3Detector._normalize_datetime(value)
+        except TypeError, ValueError:
+            return None
+
     def reconcile_from_history(
         self,
         symbol: str,
