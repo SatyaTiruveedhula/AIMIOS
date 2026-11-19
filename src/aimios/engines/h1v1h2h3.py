@@ -27,6 +27,8 @@ class _H1V1H2H3State:
     h2_timestamp: Optional[datetime] = None
     h3: Optional[float] = None
     h3_timestamp: Optional[datetime] = None
+    first_alert_direction: Optional[str] = None
+    first_alert_timestamp: Optional[datetime] = None
     alerted: set[str] = field(default_factory=set)
 
 
@@ -146,6 +148,9 @@ class H1V1H2H3Detector:
         state.h2_timestamp = None
         state.h3 = None
         state.h3_timestamp = None
+        state.first_alert_direction = None
+        state.first_alert_timestamp = None
+        state.alerted = set()
 
     def _ensure_state(self, symbol: str, candle: Any) -> _H1V1H2H3State:
         candle_dt = self._normalize_datetime(candle.timestamp)
@@ -400,51 +405,71 @@ class H1V1H2H3Detector:
             )
 
         alerts: List[Dict[str, Any]] = []
-        for direction_key, alert_direction in (("up", "CE"), ("down", "PE")):
-            if alert_direction in alerted_today:
-                continue
 
+        first_direction_to_alert = {
+            "up": ("up", "CE"),
+            "down": ("down", "PE"),
+        }
+        first_direction_key, first_alert_direction = first_direction_to_alert[
+            state.trigger_direction
+        ]
+
+        if first_alert_direction not in alerted_today:
             setup = self._pattern_for_direction(
                 sorted_history,
                 state.trigger_timestamp,
-                direction_key,
+                first_direction_key,
             )
-            if setup is None:
-                continue
+            if setup is not None:
+                h3_ts = setup["h3_ts"]
+                elapsed_minutes = (
+                    h3_ts - state.trigger_timestamp
+                ).total_seconds() / 60.0
+                if elapsed_minutes > self.min_wait_minutes:
+                    alerts.append(
+                        self._build_alert(
+                            symbol,
+                            candle,
+                            first_alert_direction,
+                            h1=float(setup["h1"]),
+                            v1=float(setup["v1"]),
+                            h2=float(setup["h2"]),
+                            h3=float(setup["h3"]),
+                            waiting_minutes=elapsed_minutes,
+                        )
+                    )
+                    alerted_today.add(first_alert_direction)
+                    state.first_alert_direction = first_alert_direction
+                    state.first_alert_timestamp = h3_ts
 
-            previous_h1 = state.h1
-            if previous_h1 is None or float(setup["h1"]) != float(previous_h1):
-                state.h1 = float(setup["h1"])
-                state.h1_timestamp = setup["h1_ts"]
-
-            previous_v1 = state.v1
-            if previous_v1 is None or float(setup["v1"]) != float(previous_v1):
-                state.v1 = float(setup["v1"])
-                state.v1_timestamp = setup["v1_ts"]
-
-            previous_h2 = state.h2
-            if previous_h2 is None or float(setup["h2"]) != float(previous_h2):
-                state.h2 = float(setup["h2"])
-                state.h2_timestamp = setup["h2_ts"]
-
-            h3_ts = setup["h3_ts"]
-            elapsed_minutes = (h3_ts - state.trigger_timestamp).total_seconds() / 60.0
-            if elapsed_minutes <= self.min_wait_minutes:
-                continue
-
-            alerts.append(
-                self._build_alert(
-                    symbol,
-                    candle,
-                    alert_direction,
-                    h1=float(setup["h1"]),
-                    v1=float(setup["v1"]),
-                    h2=float(setup["h2"]),
-                    h3=float(setup["h3"]),
-                    waiting_minutes=elapsed_minutes,
+        if state.first_alert_direction is not None:
+            opposite_direction = "PE" if state.first_alert_direction == "CE" else "CE"
+            if opposite_direction not in alerted_today:
+                opposite_key = "down" if opposite_direction == "PE" else "up"
+                opposite_setup = self._pattern_for_direction(
+                    sorted_history,
+                    state.first_alert_timestamp,
+                    opposite_key,
                 )
-            )
-            alerted_today.add(alert_direction)
+                if opposite_setup is not None:
+                    opposite_h3_ts = opposite_setup["h3_ts"]
+                    elapsed_minutes = (
+                        opposite_h3_ts - state.first_alert_timestamp
+                    ).total_seconds() / 60.0
+                    if elapsed_minutes > self.min_wait_minutes:
+                        alerts.append(
+                            self._build_alert(
+                                symbol,
+                                candle,
+                                opposite_direction,
+                                h1=float(opposite_setup["h1"]),
+                                v1=float(opposite_setup["v1"]),
+                                h2=float(opposite_setup["h2"]),
+                                h3=float(opposite_setup["h3"]),
+                                waiting_minutes=elapsed_minutes,
+                            )
+                        )
+                        alerted_today.add(opposite_direction)
 
         if not alerts:
             return []
@@ -661,6 +686,12 @@ class H1V1H2H3Detector:
                     if state.h3_timestamp is not None
                     else None
                 ),
+                "first_alert_direction": state.first_alert_direction,
+                "first_alert_timestamp": (
+                    state.first_alert_timestamp.isoformat()
+                    if state.first_alert_timestamp is not None
+                    else None
+                ),
             }
 
         return {
@@ -709,6 +740,10 @@ class H1V1H2H3Detector:
                 h2_timestamp=self._parse_saved_datetime(item.get("h2_timestamp")),
                 h3=item.get("h3"),
                 h3_timestamp=self._parse_saved_datetime(item.get("h3_timestamp")),
+                first_alert_direction=item.get("first_alert_direction"),
+                first_alert_timestamp=self._parse_saved_datetime(
+                    item.get("first_alert_timestamp")
+                ),
             )
             self._daily_state[day_key] = state
 
@@ -788,6 +823,8 @@ class H1V1H2H3Detector:
         state.h2_timestamp = None
         state.h3 = None
         state.h3_timestamp = None
+        state.first_alert_direction = None
+        state.first_alert_timestamp = None
 
         direction_key = "up" if direction == "up" else "down"
         setup = self._pattern_for_direction(

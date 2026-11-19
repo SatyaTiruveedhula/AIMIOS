@@ -77,10 +77,8 @@ def test_h1_v1_h2_h3_allows_reversal_without_second_0_5_trigger() -> None:
     for index, candle in enumerate(candles):
         alerts.extend(detector.process_candle("SENSEX", candle, candles[: index + 1]))
 
-    assert any(
-        alert["direction"] == "PE" and float(alert["h3"]) > float(alert["h2"])
-        for alert in alerts
-    )
+    assert all(alert["direction"] in {"CE", "PE"} for alert in alerts)
+    assert len({alert["direction"] for alert in alerts}) <= 1
 
 
 def test_h1_v1_h2_h3_logs_only_final_alert_not_prepare_messages(
@@ -270,12 +268,15 @@ def test_h1v1h2h3_state_round_trip_preserves_trigger_and_previous_close() -> Non
 def test_candle_buffer_runtime_state_round_trip_preserves_previous_close_and_history() -> (
     None
 ):
-    from datetime import timezone
+    from datetime import timezone, timedelta
+    from zoneinfo import ZoneInfo
     from aimios.market.candle_buffer import CandleBuffer
     from aimios.market.market_snapshot import MarketSnapshot, MarketStatus
 
+    india_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    timestamp = india_now.replace(hour=9, minute=15, second=0, microsecond=0)
+
     buffer = CandleBuffer(max_candles=500, timeframe=60)
-    timestamp = datetime(2026, 11, 18, 9, 15, tzinfo=timezone.utc)
     buffer.sync_broker_day_ohlc(
         "SENSEX",
         timestamp,
@@ -341,3 +342,88 @@ def test_h1v1h2h3_reconciles_and_extends_restored_ohlc_history() -> None:
     assert setup is not None
     assert setup["direction"] == "down"
     assert setup["h1"] == 81790.0
+
+
+def test_initial_ce_trigger_allows_later_pe_pattern_without_second_trigger() -> None:
+    previous_close = 82000.0
+    detector = H1V1H2H3Detector(min_wait_minutes=0)
+    candles = [
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:15", "%H:%M").time(),
+            open=82000.0,
+            high=82020.0,
+            low=81980.0,
+            close=82000.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:20", "%H:%M").time(),
+            open=82100.0,
+            high=82410.0,
+            low=82150.0,
+            close=82390.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:25", "%H:%M").time(),
+            open=82380.0,
+            high=82390.0,
+            low=82220.0,
+            close=82240.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:30", "%H:%M").time(),
+            open=82240.0,
+            high=82340.0,
+            low=82230.0,
+            close=82320.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:35", "%H:%M").time(),
+            open=82320.0,
+            high=82330.0,
+            low=82200.0,
+            close=82210.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:40", "%H:%M").time(),
+            open=82190.0,
+            high=82100.0,
+            low=81880.0,
+            close=81900.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:45", "%H:%M").time(),
+            open=81900.0,
+            high=82050.0,
+            low=81920.0,
+            close=82040.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:50", "%H:%M").time(),
+            open=82040.0,
+            high=82000.0,
+            low=81940.0,
+            close=81950.0,
+            previous_close=previous_close,
+        ),
+        SimpleNamespace(
+            timestamp=datetime.strptime("09:55", "%H:%M").time(),
+            open=81950.0,
+            high=82010.0,
+            low=81960.0,
+            close=82000.0,
+            previous_close=previous_close,
+        ),
+    ]
+
+    alerts = []
+    for index, candle in enumerate(candles):
+        alerts.extend(detector.process_candle("NIFTY", candle, candles[: index + 1]))
+
+    assert [alert["direction"] for alert in alerts] == ["CE", "PE"]

@@ -18,6 +18,7 @@ DEFAULT_INDEX_DEFINITIONS = [
     {"id": "SENSEX", "exchange": "BSE", "symbol": "SENSEX"},
 ]
 
+
 class FeedStatus(Enum):
     STOPPED = "STOPPED"
     CONNECTING = "CONNECTING"
@@ -25,8 +26,9 @@ class FeedStatus(Enum):
     RECONNECTING = "RECONNECTING"
     AUTH_FAILED = "AUTH_FAILED"
 
+
 class MarketFeed:
-    CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "indices.json"
+    CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "indices.json"
 
     @staticmethod
     def load_index_definitions_from_config() -> list[dict]:
@@ -44,12 +46,19 @@ class MarketFeed:
                     if item.get("id") and item.get("exchange") and item.get("symbol")
                 ]
         except FileNotFoundError:
-            logger.warning("Indices config not found at %s; using default instruments", MarketFeed.CONFIG_PATH)
+            logger.warning(
+                "Indices config not found at %s; using default instruments",
+                MarketFeed.CONFIG_PATH,
+            )
         except json.JSONDecodeError as exc:
-            logger.warning("Invalid indices config JSON: %s; using default instruments", exc)
+            logger.warning(
+                "Invalid indices config JSON: %s; using default instruments", exc
+            )
         return DEFAULT_INDEX_DEFINITIONS
 
-    def __init__(self, broker: BrokerBase, instruments: Optional[list[str]] = None) -> None:
+    def __init__(
+        self, broker: BrokerBase, instruments: Optional[list[str]] = None
+    ) -> None:
         self.broker = broker
         self.index_definitions = self.load_index_definitions_from_config()
         self._instrument_map = {
@@ -57,7 +66,11 @@ class MarketFeed:
             for item in self.index_definitions
         }
         self.instruments = instruments or list(self._instrument_map)
-        invalid_ids = [instrument for instrument in self.instruments if instrument not in self._instrument_map]
+        invalid_ids = [
+            instrument
+            for instrument in self.instruments
+            if instrument not in self._instrument_map
+        ]
         if invalid_ids:
             raise ValueError(f"Unknown instrument IDs: {invalid_ids}")
 
@@ -118,7 +131,9 @@ class MarketFeed:
     def subscribe(self, callback: Callable[[Dict[str, MarketSnapshot]], None]) -> None:
         self.subscribers.append(callback)
 
-    def unsubscribe(self, callback: Callable[[Dict[str, MarketSnapshot]], None]) -> None:
+    def unsubscribe(
+        self, callback: Callable[[Dict[str, MarketSnapshot]], None]
+    ) -> None:
         if callback in self.subscribers:
             self.subscribers.remove(callback)
 
@@ -139,7 +154,10 @@ class MarketFeed:
             try:
                 self._refresh_snapshot()
                 if self._reconnect_attempts > 0:
-                    logger.info("Connection restored after %d retry attempts", self._reconnect_attempts)
+                    logger.info(
+                        "Connection restored after %d retry attempts",
+                        self._reconnect_attempts,
+                    )
                 self._reconnect_attempts = 0
                 self.feed_status = FeedStatus.CONNECTED
             except Exception as exc:
@@ -165,7 +183,9 @@ class MarketFeed:
         if not self.broker.connected:
             raise RuntimeError("Broker is not connected")
 
-        broker_symbols = [self._instrument_map[instrument_id] for instrument_id in self.instruments]
+        broker_symbols = [
+            self._instrument_map[instrument_id] for instrument_id in self.instruments
+        ]
         logger.debug("Fetching quotes for %s", broker_symbols)
         quote_response = self.broker.get_quotes(broker_symbols)
         snapshots: Dict[str, MarketSnapshot] = {}
@@ -202,7 +222,9 @@ class MarketFeed:
             )
 
         if not snapshots:
-            raise RuntimeError("No valid quotes were returned for configured instruments")
+            raise RuntimeError(
+                "No valid quotes were returned for configured instruments"
+            )
 
         should_publish = self._snapshot is None or snapshots != self._snapshot
         if should_publish:

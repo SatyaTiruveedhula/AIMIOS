@@ -495,7 +495,7 @@ class KiteLiveFeed:
                             if getattr(setup, "valley_timestamp", None) is not None
                             else None
                         ),
-                        "valley_candle_id": getattr(setup, "valley_candle_id", None),
+                        "valley_candle_id": getattr(setup, "valley_candle_id", 0),
                         "waiting_printed": bool(
                             getattr(setup, "waiting_printed", False)
                         ),
@@ -526,7 +526,7 @@ class KiteLiveFeed:
                             if getattr(setup, "peak_timestamp", None) is not None
                             else None
                         ),
-                        "peak_candle_id": getattr(setup, "peak_candle_id", None),
+                        "peak_candle_id": item.get("peak_candle_id", 0),
                         "waiting_printed": bool(
                             getattr(setup, "waiting_printed", False)
                         ),
@@ -619,7 +619,7 @@ class KiteLiveFeed:
                             if item.get("valley_timestamp")
                             else None
                         ),
-                        "valley_candle_id": item.get("valley_candle_id"),
+                        "valley_candle_id": item.get("valley_candle_id", 0),
                         "waiting_printed": bool(item.get("waiting_printed", False)),
                         "active": bool(item.get("active", True)),
                     },
@@ -651,7 +651,7 @@ class KiteLiveFeed:
                             if item.get("peak_timestamp")
                             else None
                         ),
-                        "peak_candle_id": item.get("peak_candle_id"),
+                        "peak_candle_id": item.get("peak_candle_id", 0),
                         "waiting_printed": bool(item.get("waiting_printed", False)),
                         "active": bool(item.get("active", True)),
                     },
@@ -1369,11 +1369,6 @@ class KiteLiveFeed:
                             or reconciled_candles[-1].timestamp != live_candle.timestamp
                         ):
                             reconciled_candles.append(live_candle)
-                    if reconciled_candles:
-                        self.h1v1h2h3_detector.reconcile_from_history(
-                            str(instrument_id),
-                            reconciled_candles,
-                        )
                 except Exception:
                     logger.exception(
                         "Failed live H1V1H2H3 reconciliation for %s",
@@ -2491,6 +2486,14 @@ class KiteLiveFeed:
 
         now = datetime.now(IST)
         start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        end = now
+
+        if now < start:
+            return
+
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if end > market_close:
+            end = market_close
 
         token_by_symbol = {
             "NIFTY": 256265,
@@ -2533,7 +2536,7 @@ class KiteLiveFeed:
                 data = self._broker.get_historical(
                     str(token),
                     start,
-                    timestamp,
+                    end,
                     "1minute",
                 )
                 if not isinstance(data, list):
